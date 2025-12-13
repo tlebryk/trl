@@ -1,205 +1,104 @@
-# TRL - Transformer Reinforcement Learning
+# Token-Level Rewards for DPO & PPO (RLSF)
 
-<div style="text-align: center">
-    <img src="https://huggingface.co/datasets/trl-lib/documentation-images/resolve/main/trl_banner_dark.png" alt="TRL Banner">
-</div>
+A complete framework for training LLMs with token-level rewards derived from symbolic feedback (compilers, runtime execution, etc.), inspired by the [RLSF paper](https://arxiv.org/abs/2405.16661).
 
-<hr> <br>
+This project implements a pipeline that generates C++ code, compiles it, runs it with sanitizers (ASan/UBSan), maps errors to specific source lines, and trains a model to prefer correct code using token-weighted DPO or PPO.
 
-<h3 align="center">
-    <p>A comprehensive library to post-train foundation models</p>
-</h3>
+## 🚀 Quick Start
 
-<p align="center">
-    <a href="https://github.com/huggingface/trl/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/huggingface/trl.svg?color=blue"></a>
-    <a href="https://huggingface.co/docs/trl/index"><img alt="Documentation" src="https://img.shields.io/website?label=documentation&url=https%3A%2F%2Fhuggingface.co%2Fdocs%2Ftrl%2Findex&down_color=red&down_message=offline&up_color=blue&up_message=online"></a>
-    <a href="https://github.com/huggingface/trl/releases"><img alt="GitHub release" src="https://img.shields.io/github/release/huggingface/trl.svg"></a>
-    <a href="https://huggingface.co/trl-lib"><img alt="Hugging Face Hub" src="https://img.shields.io/badge/🤗%20Hub-trl--lib-yellow"></a>
-</p>
-
-## 🎉 What's New
-
-**OpenEnv Integration:** TRL now supports **[OpenEnv](https://huggingface.co/blog/openenv)**, the open-source framework from Meta for defining, deploying, and interacting with environments in reinforcement learning and agentic workflows.
-
-Explore how to seamlessly integrate TRL with OpenEnv in our [dedicated documentation](https://huggingface.co/docs/trl/openenv).
-
-## Overview
-
-TRL is a cutting-edge library designed for post-training foundation models using advanced techniques like Supervised Fine-Tuning (SFT), Group Realtive Policy Optimization (GRPO), and Direct Preference Optimization (DPO). Built on top of the [🤗 Transformers](https://github.com/huggingface/transformers) ecosystem, TRL supports a variety of model architectures and modalities, and can be scaled-up across various hardware setups.
-
-## Highlights
-
-- **Trainers**: Various fine-tuning methods are easily accessible via trainers like [`SFTTrainer`](https://huggingface.co/docs/trl/sft_trainer), [`GRPOTrainer`](https://huggingface.co/docs/trl/grpo_trainer), [`DPOTrainer`](https://huggingface.co/docs/trl/dpo_trainer), [`RewardTrainer`](https://huggingface.co/docs/trl/reward_trainer) and more.
-
-- **Efficient and scalable**:
-  - Leverages [🤗 Accelerate](https://github.com/huggingface/accelerate) to scale from single GPU to multi-node clusters using methods like [DDP](https://pytorch.org/tutorials/intermediate/ddp_tutorial.html) and [DeepSpeed](https://github.com/deepspeedai/DeepSpeed).
-  - Full integration with [🤗 PEFT](https://github.com/huggingface/peft) enables training on large models with modest hardware via quantization and LoRA/QLoRA.
-  - Integrates [🦥 Unsloth](https://github.com/unslothai/unsloth) for accelerating training using optimized kernels.
-
-- **Command Line Interface (CLI)**: A simple interface lets you fine-tune with models without needing to write code.
-
-## Installation
-
-### Python Package
-
-Install the library using `pip`:
+### 1. Generate Data & Rewards
+Run the full pipeline to create examples, compile/run them, and compute token rewards.
 
 ```bash
-pip install trl
+python -m cpp_pipeline.run_pipeline
 ```
+*Outputs: `cpp_pipeline/examples/`, `cpp_pipeline/compiled/`, `cpp_pipeline/rewards/`*
 
-### From source
+### 2. Train with Modal
+Submit a training job to Modal (uses T4 GPU).
 
-If you want to use the latest features before an official release, you can install TRL from source:
-
+**Option A: DPO (Direct Preference Optimization)**
+Use offline dataset of chosen/rejected pairs with pre-computed rewards.
 ```bash
-pip install git+https://github.com/huggingface/trl.git
+modal run training/modal_train.py
 ```
 
-### Repository
-
-If you want to use the examples you can clone the repository with the following command:
-
+**Option B: PPO (Proximal Policy Optimization)**
+Use online generation with real-time feedback (compile/run).
 ```bash
-git clone https://github.com/huggingface/trl.git
+modal run training/modal_train_ppo.py
 ```
 
-## Quick Start
+*Outputs: Model checkpoints in Modal Volume `dpo-training-vol`*
 
-For more flexibility and control over training, TRL provides dedicated trainer classes to post-train language models or PEFT adapters on a custom dataset. Each trainer in TRL is a light wrapper around the 🤗 Transformers trainer and natively supports distributed training methods like DDP, DeepSpeed ZeRO, and FSDP.
+## 🏗 Architecture
 
-### `SFTTrainer`
+### 1. Data Pipeline (`cpp_pipeline/`)
+Modular stages to transform code into training data.
 
-Here is a basic example of how to use the [`SFTTrainer`](https://huggingface.co/docs/trl/sft_trainer):
+| Stage | Script | Description |
+|-------|--------|-------------|
+| **1. Create** | `create_examples.py` | Generates C++ source pairs (chosen/rejected). |
+| **2. Compile** | `compile_examples.py` | Compiles with `g++ -fsanitize=address -fsanitize=undefined`. Captures syntax errors. |
+| **3. Run** | `run_examples.py` | Executes binaries. Captures runtime crashes (segfaults, overflows) & stack traces. |
+| **4. Rewards** | `compute_rewards.py` | Maps errors to tokens. Assigns rewards: **1.0** (Clean), **0.2** (Runtime Error), **0.0** (Compile Error). |
+| **5. Dataset** | `prepare_dataset.py` | Loads everything into a HuggingFace Dataset for training. |
 
-```python
-from trl import SFTTrainer
-from datasets import load_dataset
+### 2. Training (`training/`)
+Scripts for fine-tuning the model.
 
-dataset = load_dataset("trl-lib/Capybara", split="train")
+- **`train.py`**: DPO training loop.
+  - Model: `Qwen/Qwen2.5-Coder-0.5B-Instruct`
+  - Method: LoRA + Token-Weighted DPO
+  - Trainer: Custom `TokenRewardDPOTrainer`
+- **`train_ppo.py`**: PPO training loop.
+  - Method: Online PPO + Token-Weighted Rewards
+  - Reward Function: Compiles & Runs generated code on-the-fly.
+  - Trainer: Custom `TokenRewardPPOTrainer`
+- **`modal_train.py`**: Infrastructure wrapper for DPO.
+- **`modal_train_ppo.py`**: Infrastructure wrapper for PPO.
 
-trainer = SFTTrainer(
-    model="Qwen/Qwen2.5-0.5B",
-    train_dataset=dataset,
-)
-trainer.train()
+### 3. Custom Trainers
+- **`dpo_trainer_token_rewards.py`**: Extends `DPOTrainer` to weight log-probs by per-token rewards.
+- **`ppo_trainer_token_rewards.py`**: Extends `PPOTrainer` to inject dense token-level rewards during the PPO update step.
+
+## 📂 Project Structure
+
+```
+.
+├── cpp_pipeline/          # Data generation & processing
+│   ├── examples/          # Source code & metadata
+│   ├── compiled/          # Compiler/Runtime feedback JSONs
+│   ├── rewards/           # Computed token rewards JSONs
+│   ├── cpp_utils.py       # Compilation/Execution helpers
+│   └── ...
+├── training/              # Training scripts
+│   ├── train.py           # DPO training script
+│   ├── train_ppo.py       # PPO training script
+│   ├── modal_train.py     # Modal wrapper (DPO)
+│   └── modal_train_ppo.py # Modal wrapper (PPO)
+├── dpo_trainer_token_rewards.py  # Custom DPO Trainer
+├── ppo_trainer_token_rewards.py  # Custom PPO Trainer
+└── README.md              # This file
 ```
 
-### `GRPOTrainer`
+## 🧠 Key Concepts
 
-[`GRPOTrainer`](https://huggingface.co/docs/trl/grpo_trainer) implements the [Group Relative Policy Optimization (GRPO) algorithm](https://huggingface.co/papers/2402.03300) that is more memory-efficient than PPO and was used to train [Deepseek AI's R1](https://huggingface.co/deepseek-ai/DeepSeek-R1).
+**Reward Curriculum:**
+The reward scheme creates a natural curriculum for the model:
+1.  **Syntactic Correctness**: First, learn to compile (avoid 0.0 penalty).
+2.  **Runtime Safety**: Next, learn to not crash (avoid 0.2 penalty).
+3.  **Functional Correctness**: Finally, write clean code (aim for 1.0).
 
-```python
-from datasets import load_dataset
-from trl import GRPOTrainer
-from trl.rewards import accuracy_reward
+**Symbolic Feedback:**
+Instead of a single scalar reward ("Bad Code"), we give precise feedback:
+- "This specific line caused a segfault."
+- "This specific line has a syntax error."
+This allows the model to learn *exactly* what went wrong.
 
-dataset = load_dataset("trl-lib/DeepMath-103K", split="train")
+## 🛠 Prerequisites
 
-trainer = GRPOTrainer(
-    model="Qwen/Qwen2-0.5B-Instruct",
-    reward_funcs=accuracy_reward,
-    train_dataset=dataset,
-)
-trainer.train()
-```
-
-### `DPOTrainer`
-
-[`DPOTrainer`](https://huggingface.co/docs/trl/dpo_trainer) implements the popular [Direct Preference Optimization (DPO) algorithm](https://huggingface.co/papers/2305.18290) that was used to post-train [Llama 3](https://huggingface.co/papers/2407.21783) and many other models. Here is a basic example of how to use the `DPOTrainer`:
-
-```python
-from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from trl import DPOConfig, DPOTrainer
-
-model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
-dataset = load_dataset("trl-lib/ultrafeedback_binarized", split="train")
-training_args = DPOConfig(output_dir="Qwen2.5-0.5B-DPO")
-trainer = DPOTrainer(
-    model=model,
-    args=training_args,
-    train_dataset=dataset,
-    processing_class=tokenizer
-)
-trainer.train()
-```
-
-### `RewardTrainer`
-
-Here is a basic example of how to use the [`RewardTrainer`](https://huggingface.co/docs/trl/reward_trainer):
-
-```python
-from trl import RewardTrainer
-from datasets import load_dataset
-
-dataset = load_dataset("trl-lib/ultrafeedback_binarized", split="train")
-
-trainer = RewardTrainer(
-    model="Qwen/Qwen2.5-0.5B-Instruct",
-    train_dataset=dataset,
-)
-trainer.train()
-```
-
-## Command Line Interface (CLI)
-
-You can use the TRL Command Line Interface (CLI) to quickly get started with post-training methods like Supervised Fine-Tuning (SFT) or Direct Preference Optimization (DPO):
-
-**SFT:**
-
-```bash
-trl sft --model_name_or_path Qwen/Qwen2.5-0.5B \
-    --dataset_name trl-lib/Capybara \
-    --output_dir Qwen2.5-0.5B-SFT
-```
-
-**DPO:**
-
-```bash
-trl dpo --model_name_or_path Qwen/Qwen2.5-0.5B-Instruct \
-    --dataset_name argilla/Capybara-Preferences \
-    --output_dir Qwen2.5-0.5B-DPO 
-```
-
-Read more about CLI in the [relevant documentation section](https://huggingface.co/docs/trl/clis) or use `--help` for more details.
-
-## Development
-
-If you want to contribute to `trl` or customize it to your needs make sure to read the [contribution guide](https://github.com/huggingface/trl/blob/main/CONTRIBUTING.md) and make sure you make a dev install:
-
-```bash
-git clone https://github.com/huggingface/trl.git
-cd trl/
-pip install -e .[dev]
-```
-
-## Experimental
-
-A minimal incubation area is available under `trl.experimental` for unstable / fast-evolving features. Anything there may change or be removed in any release without notice.
-
-Example:
-
-```python
-from trl.experimental.new_trainer import NewTrainer
-```
-
-Read more in the [Experimental docs](https://huggingface.co/docs/trl/experimental_overview).
-
-## Citation
-
-```bibtex
-@misc{vonwerra2022trl,
-  author = {Leandro von Werra and Younes Belkada and Lewis Tunstall and Edward Beeching and Tristan Thrush and Nathan Lambert and Shengyi Huang and Kashif Rasul and Quentin Gallouédec},
-  title = {TRL: Transformer Reinforcement Learning},
-  year = {2020},
-  publisher = {GitHub},
-  journal = {GitHub repository},
-  howpublished = {\url{https://github.com/huggingface/trl}}
-}
-```
-
-## License
-
-This repository's source code is available under the [Apache-2.0 License](LICENSE).
+- Python 3.10+
+- `g++` (with ASan/UBSan support)
+- `modal` (for cloud training)
+- Dependencies: `transformers`, `peft`, `trl`, `datasets`, `torch`

@@ -1,0 +1,7 @@
+{
+  "example_id": "example_007",
+  "prompt": "Write a C++ program using std::vector to store and print numbers.",
+  "created_at": "2025-12-13T10:36:15.173658",
+  "source": "manual",
+  "model_version": null
+}

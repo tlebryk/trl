@@ -1,0 +1,7 @@
+{
+  "example_id": "example_006",
+  "prompt": "Write a C++ program that uses a for loop to print numbers 1 to 10.",
+  "created_at": "2025-12-13T12:27:16.535310",
+  "source": "manual",
+  "model_version": null
+}

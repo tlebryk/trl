@@ -2,7 +2,6 @@ import os
 import sys
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import LoraConfig, get_peft_model, TaskType
 from trl import DPOConfig
 from pathlib import Path
 
@@ -12,6 +11,7 @@ sys.path.insert(0, project_root)
 
 from dpo_trainer_token_rewards import TokenRewardDPOTrainer
 from cpp_pipeline import prepare_dataset
+from training.config.lora_config import get_unified_lora_config
 
 def main():
     # --- Configuration ---
@@ -51,19 +51,8 @@ def main():
 
     # --- Configure LoRA ---
     print("Configuring LoRA...")
-    peft_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-    )
-    
-    # We don't need to call get_peft_model explicitly for TRL/DPOTrainer usually, 
-    # as passing peft_config to the trainer handles it, but doing it here allows explicit verification.
-    model = get_peft_model(model, peft_config)
-    model.print_trainable_parameters()
+    # Use unified LoRA config to ensure compatibility with PPO adapters
+    peft_config = get_unified_lora_config()
 
     # --- Training Config ---
     training_args = DPOConfig(
@@ -76,20 +65,26 @@ def main():
         gradient_accumulation_steps=4,
         num_train_epochs=3,
         logging_steps=1,
-        save_strategy="epoch",
+        save_strategy="no",  # Don't save intermediate checkpoints
+        save_only_model=True,  # Skip optimizer/scheduler states (saves space)
         bf16=True, # Use bfloat16
         remove_unused_columns=False,
         report_to="tensorboard",
     )
 
+    # --- Determine reward strategy from environment variable ---
+    use_token_level_rewards_str = os.environ.get("USE_TOKEN_LEVEL_REWARDS", "True")
+    use_token_level_rewards = use_token_level_rewards_str.lower() in ("true", "1", "t")
+
     # --- Initialize Trainer ---
-    print("Initializing TokenRewardDPOTrainer...")
+    print(f"Initializing TokenRewardDPOTrainer (use_token_level_rewards={use_token_level_rewards})...")
     trainer = TokenRewardDPOTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         processing_class=tokenizer,
-        use_token_level_rewards=True # Enable our custom logic
+        use_token_level_rewards=use_token_level_rewards,
+        peft_config=peft_config,  # Pass LoRA config to trainer
     )
 
     # --- Train ---

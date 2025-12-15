@@ -6,9 +6,16 @@ a dataset ready for training with DPO.
 """
 
 import json
+import sys
 from pathlib import Path
 from typing import List, Dict
 from datasets import Dataset
+
+# Add project root to path to import training config
+project_root = str(Path(__file__).parent.parent)
+sys.path.insert(0, project_root)
+
+from training.config.reward_config import RewardConfig
 
 
 def load_example_data(example_id: str, base_dir: str = "cpp_pipeline") -> Dict:
@@ -40,14 +47,24 @@ def load_example_data(example_id: str, base_dir: str = "cpp_pipeline") -> Dict:
     # Load rewards
     chosen_rewards = json.loads((rewards_dir / "chosen_rewards.json").read_text())
     rejected_rewards = json.loads((rewards_dir / "rejected_rewards.json").read_text())
-    
+
+    # Compute sequence-level rewards from token-level rewards
+    reward_config = RewardConfig()
+    chosen_reward = reward_config.sequence_reward_from_tokens(chosen_rewards["token_rewards"])
+    rejected_reward = reward_config.sequence_reward_from_tokens(rejected_rewards["token_rewards"])
+
     return {
         "example_id": example_id,
         "prompt": metadata["prompt"],
         "chosen": chosen_code,
         "rejected": rejected_code,
+        # Token-level rewards
         "chosen_token_rewards": chosen_rewards["token_rewards"],
         "rejected_token_rewards": rejected_rewards["token_rewards"],
+        # Sequence-level rewards (mean of token rewards)
+        "chosen_reward": chosen_reward,
+        "rejected_reward": rejected_reward,
+        # Compilation metadata
         "chosen_compiles": chosen_feedback["compiles"],
         "rejected_compiles": rejected_feedback["compiles"],
         "chosen_errors": chosen_feedback["errors"],

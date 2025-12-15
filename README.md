@@ -20,7 +20,7 @@ Submit a training job to Modal (uses T4 GPU).
 **Option A: DPO (Direct Preference Optimization)**
 Use offline dataset of chosen/rejected pairs with pre-computed rewards.
 ```bash
-modal run training/modal_train.py
+modal run training/modal_train_dpo.py
 ```
 
 **Option B: PPO (Proximal Policy Optimization)**
@@ -47,7 +47,7 @@ Modular stages to transform code into training data.
 ### 2. Training (`training/`)
 Scripts for fine-tuning the model.
 
-- **`train.py`**: DPO training loop.
+- **`train_dpo.py`**: DPO training loop.
   - Model: `Qwen/Qwen2.5-Coder-0.5B-Instruct`
   - Method: LoRA + Token-Weighted DPO
   - Trainer: Custom `TokenRewardDPOTrainer`
@@ -55,7 +55,7 @@ Scripts for fine-tuning the model.
   - Method: Online PPO + Token-Weighted Rewards
   - Reward Function: Compiles & Runs generated code on-the-fly.
   - Trainer: Custom `TokenRewardPPOTrainer`
-- **`modal_train.py`**: Infrastructure wrapper for DPO.
+- **`modal_train_dpo.py`**: Infrastructure wrapper for DPO.
 - **`modal_train_ppo.py`**: Infrastructure wrapper for PPO.
 
 ### 3. Custom Trainers
@@ -73,7 +73,7 @@ Scripts for fine-tuning the model.
 │   ├── cpp_utils.py       # Compilation/Execution helpers
 │   └── ...
 ├── training/              # Training scripts
-│   ├── train.py           # DPO training script
+│   ├── train_dpo.py       # DPO training script
 │   ├── train_ppo.py       # PPO training script
 │   ├── modal_train.py     # Modal wrapper (DPO)
 │   └── modal_train_ppo.py # Modal wrapper (PPO)

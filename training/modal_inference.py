@@ -164,7 +164,8 @@ def generate_completions(
             # Prepare input with chat template
             messages = [
                 {"role": "system", "content": "You are a helpful coding assistant. Please complete the C++ code provided by the user. Output only the valid code completion."},
-                {"role": "user", "content": f"Complete the following C++ code:\n\n```cpp\n{code_prompt}\n```"}
+                {"role": "user", "content": f"Complete the following C++ code:\n\n```cpp\n{code_prompt}\n```"},
+                {"role": "assistant", "content": f"\n{code_prompt}\n"}
             ]
 
             text = tokenizer.apply_chat_template(

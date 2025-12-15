@@ -247,6 +247,8 @@ def main():
         seed=42,
         bf16=True,  # Enable bf16 on T4 GPU for speed
         fp16=False,
+        save_strategy="no",  # Don't save intermediate checkpoints
+        save_only_model=True,  # Skip optimizer/scheduler states (saves space)
     )
     # Output dir is handled by TrainingArguments usually, but PPOConfig inherits it.
     ppo_config.output_dir = output_dir

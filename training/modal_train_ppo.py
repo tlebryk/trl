@@ -1,6 +1,7 @@
 import modal
-import sys
 import os
+import json
+from datetime import datetime
 
 # Define the image with all necessary dependencies
 # We need g++ and sanitizers for PPO reward computation (compiling code on the fly)
@@ -22,6 +23,7 @@ image = (
     .add_local_file("ppo_trainer_token_rewards.py", "/root/ppo_trainer_token_rewards.py")
     .add_local_dir("cpp_pipeline", "/root/cpp_pipeline")
     .add_local_file("training/train_ppo.py", "/root/train_ppo.py")
+    .add_local_dir("training/config", "/root/training/config")
 )
 
 # Define a persistent volume to store checkpoints and logs
@@ -30,17 +32,17 @@ volume = modal.Volume.from_name("dpo-training-vol", create_if_missing=True)
 app = modal.App("token-reward-ppo", image=image)
 
 # Base remote output path where results will be written
-REMOTE_OUTPUT_DIR_BASE = "/data/results"
+REMOTE_OUTPUT_DIR_BASE = "/data/experiments"
 
 @app.function(
-    gpu="T4",  # Use T4 GPU
+    gpu="L4",  # Use T4 GPU
     timeout=7200, # 2 hours timeout (PPO might be slower due to generation)
     volumes={"/data": volume}, # Mount volume at /data
     image=image  # Use image with mounted local files
 )
-def train(use_token_level_rewards: bool = True):
+def train(experiment_name: str, use_token_level_rewards: bool = True):
     import subprocess
-    
+
     print("Listing remote directory structure:")
     subprocess.run(["ls", "-R", "/root"])
 
@@ -48,42 +50,73 @@ def train(use_token_level_rewards: bool = True):
     print("Generating example prompts...")
     subprocess.run(["python", "-m", "cpp_pipeline.create_examples"], cwd="/root", check=True)
 
-    # Determine run type and output directory
-    run_type = "ppo-token-rewards" if use_token_level_rewards else "ppo-vanilla"
-    output_dir = os.path.join(REMOTE_OUTPUT_DIR_BASE, run_type)
-    print(f"Run type: {run_type}")
+    # Create experiment directory
+    output_dir = os.path.join(REMOTE_OUTPUT_DIR_BASE, experiment_name)
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"Experiment: {experiment_name}")
+    print(f"Using token-level rewards: {use_token_level_rewards}")
     print(f"Outputting artifacts to: {output_dir}")
+
+    # Save experiment metadata
+    metadata = {
+        "experiment_name": experiment_name,
+        "use_token_level_rewards": use_token_level_rewards,
+        "timestamp": datetime.now().isoformat(),
+        "model": "Qwen/Qwen2.5-Coder-0.5B-Instruct",
+        "gpu": "T4",
+        "method": "PPO",
+    }
+    metadata_path = os.path.join(output_dir, "run_metadata.json")
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Saved metadata to {metadata_path}")
 
     # Run the training script
     env = os.environ.copy()
     env["TRAINING_OUTPUT_DIR"] = output_dir
     env["USE_TOKEN_LEVEL_REWARDS"] = str(use_token_level_rewards)
-    
+
     print("Launching PPO training script...")
     subprocess.run(["python", "/root/train_ppo.py"], env=env, check=True)
-    
+
+    # Commit volume changes
+    volume.commit()
+
     print(f"Training finished. Artifacts stored in volume at {output_dir}")
-    
+    print("\nTo download results locally:")
+    print(f"  modal volume get dpo-training-vol {output_dir} ./{experiment_name}")
+
     # List artifacts
     subprocess.run(["ls", "-lh", output_dir])
 
 @app.local_entrypoint()
-def main():
+def main(
+    experiment_name: str,
+    use_token_level_rewards: bool = True
+):
     """
     Submits a PPO training job to Modal.
 
-    By default, it runs with token-level rewards.
-    Use --no-token-rewards to run a baseline vanilla PPO training.
-    
+    Args:
+        experiment_name: Name for this experiment (e.g., "ppo-baseline-v1", "ppo-token-rewards")
+        use_token_level_rewards: Enable token-level rewards (default: True)
+
     Examples:
-    # Run with token-level rewards
-    python training/modal_train_ppo.py
-    
-    # Run vanilla PPO
-    python training/modal_train_ppo.py --no-token-rewards
+        # Run with token-level rewards
+        modal run training/modal_train_ppo.py --experiment-name ppo-token-rewards-v1
+
+        # Run vanilla PPO baseline
+        modal run training/modal_train_ppo.py --experiment-name ppo-baseline --use-token-level-rewards=false
+
+        # Download results after training
+        modal volume get dpo-training-vol /experiments/ppo-token-rewards-v1 ./results
     """
-    use_token_rewards = "--no-token-rewards" not in sys.argv
-    
     print("Submitting PPO training job to Modal...")
-    print(f"Using token-level rewards: {use_token_rewards}")
-    train.remote(use_token_level_rewards=use_token_rewards)
+    print(f"Experiment name: {experiment_name}")
+    print(f"Using token-level rewards: {use_token_level_rewards}")
+
+    train.remote(
+        experiment_name=experiment_name,
+        use_token_level_rewards=use_token_level_rewards
+    )

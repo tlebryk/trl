@@ -13,23 +13,55 @@ Run the full pipeline to create examples, compile/run them, and compute token re
 python -m cpp_pipeline.run_pipeline
 ```
 *Outputs: `cpp_pipeline/examples/`, `cpp_pipeline/compiled/`, `cpp_pipeline/rewards/`*
-
 ### 2. Train with Modal
-Submit a training job to Modal (uses T4 GPU).
+Submit a training job to Modal (uses T4 GPU). Each run requires a unique experiment name.
 
 **Option A: DPO (Direct Preference Optimization)**
 Use offline dataset of chosen/rejected pairs with pre-computed rewards.
 ```bash
-modal run training/modal_train_dpo.py
+# With token-level rewards
+modal run training/modal_train_dpo.py --experiment-name dpo-token-rewards-v1
+
+# Vanilla DPO baseline
+modal run training/modal_train_dpo.py --experiment-name dpo-baseline --use-token-level-rewards=false
 ```
 
 **Option B: PPO (Proximal Policy Optimization)**
 Use online generation with real-time feedback (compile/run).
 ```bash
-modal run training/modal_train_ppo.py
+# With token-level rewards
+modal run training/modal_train_ppo.py --experiment-name ppo-token-rewards-v1
+
+# Vanilla PPO baseline
+modal run training/modal_train_ppo.py --experiment-name ppo-baseline --use-token-level-rewards=false
 ```
 
-*Outputs: Model checkpoints in Modal Volume `dpo-training-vol`*
+### 3. Download Results
+Results are stored in Modal Volume `dpo-training-vol` under `/experiments/{experiment-name}`.
+
+```bash
+# List all experiments
+modal volume ls dpo-training-vol /experiments
+
+# Download specific experiment
+modal volume get dpo-training-vol /experiments/dpo-token-rewards-v1 ./results
+
+# View experiment metadata
+modal volume get dpo-training-vol /experiments/dpo-token-rewards-v1/run_metadata.json -
+```
+
+**Experiment structure:**
+```
+experiments/
+├── dpo-token-rewards-v1/
+│   ├── final_model/           # LoRA adapter + tokenizer (~35MB)
+│   ├── runs/                  # TensorBoard logs
+│   └── run_metadata.json      # Experiment config & timestamp
+└── ppo-baseline/
+    └── ...
+```
+
+*Note: Intermediate checkpoints and optimizer states are NOT saved to minimize storage and download time.*
 
 ## 🏗 Architecture
 
@@ -75,8 +107,9 @@ Scripts for fine-tuning the model.
 ├── training/              # Training scripts
 │   ├── train_dpo.py       # DPO training script
 │   ├── train_ppo.py       # PPO training script
-│   ├── modal_train.py     # Modal wrapper (DPO)
-│   └── modal_train_ppo.py # Modal wrapper (PPO)
+│   ├── modal_train_dpo.py # Modal wrapper (DPO)
+│   ├── modal_train_ppo.py # Modal wrapper (PPO)
+│   └── config/            # Shared training configs
 ├── dpo_trainer_token_rewards.py  # Custom DPO Trainer
 ├── ppo_trainer_token_rewards.py  # Custom PPO Trainer
 └── README.md              # This file

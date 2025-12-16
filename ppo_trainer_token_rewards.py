@@ -1,14 +1,35 @@
+"""
+Modified PPOTrainer with Token-Level Rewards
+
+Key modification: Instead of using only scalar rewards per sequence from a reward model,
+we support dense token-level rewards and add them to the per-token KL penalty.
+
+Standard PPO:
+  - rewards[:, t] = -kl_coef * kl[:, t]  (per-token KL penalty)
+  - rewards[:, last_token] += scalar_score  (scalar reward at end)
+
+Token-level PPO:
+  - rewards[:, t] = -kl_coef * kl[:, t] + token_reward[:, t]
+
+This implementation extends PPOTrainer to support token-level reward functions.
+"""
+
+import gc
+import math
+import time
+from collections import defaultdict
+from contextlib import nullcontext
+
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-import numpy as np
-import time
-import math
-import gc
-import os
-from pathlib import Path
-from collections import defaultdict
+from accelerate import logging
+from accelerate.utils import gather_object
 from transformers import GenerationConfig
-from trl.experimental.ppo import PPOTrainer, PPOConfig
+
+from trl.experimental.ppo import PPOTrainer
+from trl.experimental.ppo.ppo_config import PPOConfig
 from trl.models.utils import unwrap_model_for_generation
 from trl.trainer.utils import (
     batch_generation,
@@ -16,20 +37,19 @@ from trl.trainer.utils import (
     first_true_indices,
     forward,
     get_reward,
-    truncate_response,
-    selective_log_softmax,
-    OnlineTrainerState,
     log_table_to_comet_experiment,
     print_rich_table,
+    selective_log_softmax,
+    truncate_response,
 )
-from transformers.utils import is_rich_available, is_peft_available
-from accelerate.utils import broadcast, gather_object
+from transformers.utils import is_rich_available
 
-if is_peft_available():
-    from peft import PeftModel
+from typing import Optional, Callable
 
-# Helper functions copied from trl/experimental/ppo/ppo_trainer.py
+logger = logging.get_logger(__name__)
+
 INVALID_LOGPROB = 1.0
+
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor, axis: bool | None = None) -> torch.Tensor:
     """Compute mean of tensor with a masked values."""
@@ -37,6 +57,7 @@ def masked_mean(values: torch.Tensor, mask: torch.Tensor, axis: bool | None = No
         return (values * mask).sum(axis=axis) / mask.sum(axis=axis)
     else:
         return (values * mask).sum() / mask.sum()
+
 
 def masked_var(values: torch.Tensor, mask: torch.Tensor, unbiased: bool = True) -> torch.Tensor:
     """Compute variance of tensor with masked values."""
@@ -54,6 +75,7 @@ def masked_var(values: torch.Tensor, mask: torch.Tensor, unbiased: bool = True) 
         variance = variance * bessel_correction
     return variance
 
+
 def masked_whiten(values: torch.Tensor, mask: torch.Tensor, shift_mean: bool = True) -> torch.Tensor:
     """Whiten values with masked values."""
     mean, var = masked_mean(values, mask), masked_var(values, mask)
@@ -62,18 +84,51 @@ def masked_whiten(values: torch.Tensor, mask: torch.Tensor, shift_mean: bool = T
         whitened += mean
     return whitened
 
+
 class TokenRewardPPOTrainer(PPOTrainer):
     """
-    Extended PPOTrainer that supports dense token-level rewards.
-    
-    If `token_reward_fn` is provided, it is called to compute rewards for every token.
-    Otherwise, it falls back to the standard sparse reward model.
+    PPOTrainer extended to support token-level rewards.
+
+    The key insight: Different tokens in a generated sequence may have different quality.
+    By assigning per-token rewards (e.g., from compiler errors, runtime errors), we can
+    compute fine-grained advantages and teach the model exactly which tokens to improve.
+
+    Args:
+        token_reward_fn: Optional function that takes (query_ids, response_ids, response_mask, processing_class)
+                        and returns token-level rewards of shape [batch_size, response_length].
+                        If None, falls back to standard scalar rewards from reward_model.
+        use_token_level_rewards: Whether to use token-level rewards. Default: True.
+        combine_with_scalar_reward: If True, add token rewards to scalar reward. If False, replace entirely.
+        *args, **kwargs: Arguments passed to PPOTrainer.
     """
-    def __init__(self, token_reward_fn=None, *args, **kwargs):
+
+    def __init__(
+        self,
+        *args,
+        token_reward_fn: Optional[Callable] = None,
+        use_token_level_rewards: bool = True,
+        combine_with_scalar_reward: bool = False,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.token_reward_fn = token_reward_fn
+        self.use_token_level_rewards = use_token_level_rewards
+        self.combine_with_scalar_reward = combine_with_scalar_reward
+
+        if self.use_token_level_rewards and self.token_reward_fn is not None:
+            print(f"TokenRewardPPOTrainer initialized with token-level rewards")
+            print(f"  combine_with_scalar_reward={combine_with_scalar_reward}")
+        else:
+            print("TokenRewardPPOTrainer initialized without token-level rewards (using standard scalar rewards)")
 
     def train(self):
+        """
+        Override train to inject token-level rewards into the reward computation.
+
+        The main modification is in the reward computation section where we:
+        1. Compute token-level rewards using token_reward_fn
+        2. Add them to the per-token KL penalty rewards
+        """
         args = self.args
         accelerator = self.accelerator
         optimizer = self.optimizer
@@ -97,7 +152,7 @@ class TokenRewardPPOTrainer(PPOTrainer):
             do_sample=True,
         )
 
-        accelerator.print("===training policy===")
+        accelerator.print("===training policy with token-level rewards===")
         start_time = time.time()
         stats_shape = (args.num_ppo_epochs, args.num_mini_batches, args.gradient_accumulation_steps)
         approxkl_stats = torch.zeros(stats_shape, device=device)
@@ -150,19 +205,13 @@ class TokenRewardPPOTrainer(PPOTrainer):
                 scores = []
                 sequence_lengths = []
                 values = []
+                token_rewards_list = []  # NEW: store token-level rewards
+
                 with unwrap_model_for_generation(
                     self.model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
                 ) as unwrapped_model:
-                    # Experimental PPO wraps model in PolicyAndValueWrapper with .policy attribute
-                    if hasattr(unwrapped_model, 'policy'):
-                        # New experimental API or old API both have .policy
-                        policy_model = unwrapped_model.policy
-                    else:
-                        # Fallback to model itself
-                        policy_model = unwrapped_model
-
                     query_responses, logitss = batch_generation(
-                        policy_model,
+                        unwrapped_model.policy,
                         queries,
                         args.local_rollout_forward_batch_size,
                         processing_class.pad_token_id,
@@ -191,7 +240,7 @@ class TokenRewardPPOTrainer(PPOTrainer):
 
                     # Response Processing 1. truncate response after the first occurrence of `stop_token_id`
                     postprocessed_response = response
-                    if self.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0
+                    if self.stop_token_id is not None:
                         postprocessed_response = truncate_response(
                             self.stop_token_id, processing_class.pad_token_id, response
                         )
@@ -199,26 +248,34 @@ class TokenRewardPPOTrainer(PPOTrainer):
                     # Response Processing 2. run reward model on the truncated responses
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
                     sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
-                    # Experimental PPO wraps model in PolicyAndValueWrapper with .value attribute
-                    unwrapped_model = accelerator.unwrap_model(model)
-                    if hasattr(unwrapped_model, 'value_model'):
-                        # Old API: AutoModelForCausalLMWithValueHead
-                        unwrapped_value_model = unwrapped_model.value_model
-                    else:
-                        # New experimental API: PolicyAndValueWrapper with .value
-                        unwrapped_value_model = unwrapped_model.value
+                    unwrapped_value_model = accelerator.unwrap_model(model).value_model
                     full_value, _, _ = get_reward(
                         unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
                     )
                     value = full_value[:, context_length - 1 : -1].squeeze(-1)
-                    
-                    # Compute standard scores (we might use them or not)
-                    if reward_model is not None:
-                        _, score, _ = get_reward(
-                            reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                    _, score, _ = get_reward(
+                        reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                    )
+
+                    # NEW: Compute token-level rewards if function is provided
+                    if self.use_token_level_rewards and self.token_reward_fn is not None:
+                        # Create response mask
+                        response_mask = (response != processing_class.pad_token_id).float()
+
+                        token_reward = self.token_reward_fn(
+                            query_ids=query,
+                            response_ids=response,
+                            response_mask=response_mask,
+                            processing_class=processing_class,
                         )
-                    else:
-                        score = torch.zeros(query.shape[0], device=device)
+
+                        # Ensure token_reward is on correct device
+                        if not isinstance(token_reward, torch.Tensor):
+                            token_reward = torch.tensor(token_reward, dtype=torch.float32, device=device)
+                        else:
+                            token_reward = token_reward.to(device=device, dtype=torch.float32)
+
+                        token_rewards_list.append(token_reward)
 
                     responses.append(response)
                     postprocessed_responses.append(postprocessed_response)
@@ -227,6 +284,7 @@ class TokenRewardPPOTrainer(PPOTrainer):
                     sequence_lengths.append(sequence_length)
                     scores.append(score)
                     values.append(value)
+
                 responses = torch.cat(responses, 0)
                 postprocessed_responses = torch.cat(postprocessed_responses, 0)
                 logprobs = torch.cat(logprobs, 0)
@@ -234,18 +292,23 @@ class TokenRewardPPOTrainer(PPOTrainer):
                 sequence_lengths = torch.cat(sequence_lengths, 0)
                 scores = torch.cat(scores, 0)
                 values = torch.cat(values, 0)
+
+                # NEW: Concatenate token rewards if available
+                if token_rewards_list:
+                    token_rewards_batch = torch.cat(token_rewards_list, 0)
+                else:
+                    token_rewards_batch = None
+
                 del (logprob, ref_logprob, full_value, value, score, unwrapped_model)
                 empty_cache()
                 gc.collect()
 
-                # Response Processing 3. Filter completion. Ensure that the sample contains stop_token_id
-                # Completions not passing that filter will receive a lower score.
+                # Response Processing 3. Filter completion
                 contain_eos_token = torch.any(postprocessed_responses == self.processing_class.eos_token_id, dim=-1)
                 if self.args.missing_eos_penalty is not None:
                     scores[~contain_eos_token] -= self.args.missing_eos_penalty
-                # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
 
-                # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
+                # Compute padding masks
                 response_idxs = torch.arange(responses.shape[1], device=responses.device).repeat(responses.shape[0], 1)
                 padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
                 logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
@@ -254,67 +317,35 @@ class TokenRewardPPOTrainer(PPOTrainer):
                 padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
                 values = torch.masked_fill(values, padding_mask_p1, 0)
 
-                # 4. compute rewards
-                # Formula used by http://joschu.net/blog/kl-approx.html for the k1 and k3 estimators
+                # 4. compute rewards - MODIFIED FOR TOKEN-LEVEL REWARDS
                 logr = ref_logprobs - logprobs
-                kl = -logr if args.kl_estimator == "k1" else (logr.exp() - 1) - logr  # Else statement is k3
+                kl = -logr if args.kl_estimator == "k1" else (logr.exp() - 1) - logr
                 non_score_reward = -args.kl_coef * kl
                 rewards = non_score_reward.clone()
-                
-                # --- MODIFICATION START ---
-                # Initialize variables that will be deleted later
+
+                # Standard PPO: add scalar reward at end position
                 actual_start = torch.arange(rewards.size(0), device=rewards.device)
                 actual_end = torch.where(sequence_lengths_p1 < rewards.size(1), sequence_lengths_p1, sequence_lengths)
 
-                if self.token_reward_fn is not None:
-                    # dense rewards from custom function
-                    # We pass the full query_responses to the function
-                    # It should return a tensor of shape (batch_size, seq_len)
-                    dense_rewards = self.token_reward_fn(query_responses, processing_class)
+                if self.use_token_level_rewards and token_rewards_batch is not None:
+                    # TOKEN-LEVEL REWARDS: Add dense rewards to each position
+                    # Apply mask to token rewards
+                    token_rewards_batch = token_rewards_batch * (~padding_mask).float()
+                    rewards += token_rewards_batch
 
-                    # Align rewards with the 'rewards' tensor (which corresponds to response tokens)
-                    # 'rewards' has shape (batch_size, response_len)
-                    # dense_rewards has shape (batch_size, context_len + response_len)
-                    # We assume dense_rewards[t] is the reward for the token at t
-
-                    # Extract response rewards
-                    # rewards[i, t] corresponds to the token at responses[i, t]
-                    # which is query_responses[i, context_length + t]
-                    response_dense_rewards = dense_rewards[:, context_length:].to(rewards.device)
-
-                    # Truncate if necessary (though shapes should match if generated correctly)
-                    min_len = min(response_dense_rewards.shape[1], rewards.shape[1])
-                    response_dense_rewards = response_dense_rewards[:, :min_len]
-
-                    # Add to rewards
-                    # Note: We do NOT use padding_mask here because we want rewards for all generated tokens
-                    # PPO loop handles masking later via advantages masking
-                    # But 'rewards' tensor should be valid.
-
-                    # Handle shape mismatch if response_dense_rewards is shorter than rewards?
-                    # Shouldn't happen if token_reward_fn processes query_responses
-                    if rewards.shape[1] > min_len:
-                         # Pad with zeros if needed?
-                         # Usually shapes match exactly.
-                         pass
-
-                    rewards[:, :min_len] += response_dense_rewards
-
-                    # If we use token rewards, we might want to ignore 'scores' (the scalar reward)
-                    # Or add it? Usually symbolic rewards replace the scalar reward.
-                    # We'll ignore 'scores' here as we assume token_reward_fn covers it.
-
+                    if self.combine_with_scalar_reward:
+                        # Also add scalar reward at end (combine both)
+                        rewards[actual_start, actual_end] += scores
                 else:
-                    # Original logic: sparse rewards
+                    # Standard: add scalar reward at end only
                     rewards[actual_start, actual_end] += scores
-                # --- MODIFICATION END ---
 
                 # 5. whiten rewards
                 if args.whiten_rewards:
                     rewards = masked_whiten(rewards, mask=~padding_mask_p1, shift_mean=False)
                     rewards = torch.masked_fill(rewards, padding_mask_p1, 0)
 
-                # 6. compute advantages and returns
+                # 6. compute advantages and returns using GAE
                 lastgaelam = 0
                 advantages_reversed = []
                 gen_length = responses.shape[1]
@@ -329,7 +360,7 @@ class TokenRewardPPOTrainer(PPOTrainer):
                 advantages = torch.masked_fill(advantages, padding_mask, 0)
                 empty_cache()
 
-            # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
+            # Do multiple epochs of PPO training
             for ppo_epoch_idx in range(args.num_ppo_epochs):
                 b_inds = np.random.permutation(args.local_batch_size)
                 minibatch_idx = 0
@@ -399,16 +430,14 @@ class TokenRewardPPOTrainer(PPOTrainer):
                                 ratio_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = ratio.mean()
                         gradient_accumulation_idx += 1
                     minibatch_idx += 1
-                    # del everything and empty cache
-                    # fmt: off
                     del (
                         output, vpred_temp, logits, new_logprobs, vpred, vpredclipped,
                         vf_losses1, vf_losses2, vf_loss, vf_clipfrac, logprobs_diff, ratio, pg_losses, pg_losses2, pg_loss_max,
                         pg_loss, loss, pg_clipfrac, prob_dist, entropy, approxkl, mb_return,
                         mb_advantage, mb_values, mb_responses, mb_query_responses, mb_logprobs,
                     )
-                    # fmt: on
                     empty_cache()
+
             with torch.no_grad():
                 mean_kl = kl.sum(1).mean()
                 mean_entropy = (-logprobs).sum(1).mean()
@@ -424,6 +453,12 @@ class TokenRewardPPOTrainer(PPOTrainer):
                 )
                 metrics["objective/rlhf_reward"] = self.accelerator.gather_for_metrics(rlhf_reward).mean().item()
                 metrics["objective/scores"] = self.accelerator.gather_for_metrics(scores.mean()).mean().item()
+
+                # NEW: Log token reward metrics
+                if token_rewards_batch is not None:
+                    mean_token_reward = token_rewards_batch.sum(1).mean()
+                    metrics["objective/token_rewards"] = self.accelerator.gather_for_metrics(mean_token_reward).mean().item()
+
                 metrics["policy/approxkl_avg"] = self.accelerator.gather_for_metrics(approxkl_stats).mean().item()
                 metrics["policy/clipfrac_avg"] = self.accelerator.gather_for_metrics(pg_clipfrac_stats).mean().item()
                 metrics["loss/policy_avg"] = self.accelerator.gather_for_metrics(pg_loss_stats).mean().item()
@@ -435,7 +470,7 @@ class TokenRewardPPOTrainer(PPOTrainer):
                 metrics["val/num_eos_tokens"] = (responses == processing_class.eos_token_id).sum().item()
                 metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
                 metrics["episode"] = self.state.episode
-                self.state.epoch = self.state.episode / self.train_dataset_len  # used by self.log
+                self.state.epoch = self.state.episode / self.train_dataset_len
                 self.state.global_step += 1
                 self.log(metrics)
 
@@ -445,6 +480,8 @@ class TokenRewardPPOTrainer(PPOTrainer):
                 self._save_checkpoint(model, trial=None)
                 self.control = self.callback_handler.on_save(self.args, self.state, self.control)
             del kl, mean_kl, mean_entropy, mean_non_score_reward, scores, metrics, non_score_reward
+            if token_rewards_batch is not None:
+                del token_rewards_batch
             empty_cache()
             gc.collect()
 
@@ -477,3 +514,16 @@ class TokenRewardPPOTrainer(PPOTrainer):
         if self.control.should_save:
             self._save_checkpoint(model, trial=None)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+
+
+if __name__ == "__main__":
+    print("TokenRewardPPOTrainer implementation complete!")
+    print("\nKey features:")
+    print("1. Supports token-level rewards via token_reward_fn")
+    print("2. Adds dense rewards to each token position (alongside KL penalty)")
+    print("3. Optional: combine with scalar reward from reward_model")
+    print("4. Falls back to standard PPO if token_reward_fn is None")
+    print("\nTo use:")
+    print("- Provide a token_reward_fn that returns [batch_size, seq_len] rewards")
+    print("- Set use_token_level_rewards=True")
+    print("- Optionally set combine_with_scalar_reward=True to use both")

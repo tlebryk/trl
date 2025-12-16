@@ -1,6 +1,5 @@
 import modal
 import os
-import sys
 import json
 from datetime import datetime
 
@@ -36,8 +35,8 @@ app = modal.App("token-reward-ppo", image=image)
 REMOTE_OUTPUT_DIR_BASE = "/data/experiments"
 
 @app.function(
-    gpu="L4",  # Use L4 GPU (24GB, same as GRPO)
-    timeout=7200, # 2 hours timeout (PPO might be slower due to generation)
+    gpu="L4",  # Use L4 GPU (can also use T4 for smaller jobs)
+    timeout=7200, # 2 hours timeout (PPO can be slow due to generation + value estimation)
     volumes={"/data": volume}, # Mount volume at /data
     image=image  # Use image with mounted local files
 )

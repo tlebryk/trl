@@ -1,8 +1,8 @@
-# Token-Level Rewards for DPO & PPO (RLSF)
+# Token-Level Rewards for DPO, PPO & GRPO (RLSF)
 
 A complete framework for training LLMs with token-level rewards derived from symbolic feedback (compilers, runtime execution, etc.), inspired by the [RLSF paper](https://arxiv.org/abs/2405.16661).
 
-This project implements a pipeline that generates C++ code, compiles it, runs it with sanitizers (ASan/UBSan), maps errors to specific source lines, and trains a model to prefer correct code using token-weighted DPO or PPO.
+This project implements a pipeline that generates C++ code, compiles it, runs it with sanitizers (ASan/UBSan), maps errors to specific source lines, and trains a model to prefer correct code using token-weighted DPO, PPO, or GRPO.
 
 ## 🚀 Quick Start
 
@@ -14,7 +14,7 @@ python -m cpp_pipeline.run_pipeline
 ```
 *Outputs: `cpp_pipeline/examples/`, `cpp_pipeline/compiled/`, `cpp_pipeline/rewards/`*
 ### 2. Train with Modal
-Submit a training job to Modal (uses T4 GPU). Each run requires a unique experiment name.
+Submit a training job to Modal (uses L4 GPU). Each run requires a unique experiment name.
 
 **Option A: DPO (Direct Preference Optimization)**
 Use offline dataset of chosen/rejected pairs with pre-computed rewards.
@@ -34,6 +34,16 @@ modal run training/modal_train_ppo.py --experiment-name ppo-token-rewards-v1
 
 # Vanilla PPO baseline
 modal run training/modal_train_ppo.py --experiment-name ppo-baseline --use-token-level-rewards=false
+```
+
+**Option C: GRPO (Group Relative Policy Optimization)**
+Use online generation with group-wise reward normalization.
+```bash
+# With token-level rewards
+modal run training/modal_train_grpo.py --experiment-name grpo-token-rewards-v1
+
+# Vanilla GRPO baseline
+modal run training/modal_train_grpo.py --experiment-name grpo-baseline --use-token-level-rewards=false
 ```
 
 ### 3. Download Results
@@ -57,7 +67,9 @@ experiments/
 │   ├── final_model/           # LoRA adapter + tokenizer (~35MB)
 │   ├── runs/                  # TensorBoard logs
 │   └── run_metadata.json      # Experiment config & timestamp
-└── ppo-baseline/
+├── ppo-baseline/
+│   └── ...
+└── grpo-token-rewards-v1/
     └── ...
 ```
 
@@ -87,12 +99,18 @@ Scripts for fine-tuning the model.
   - Method: Online PPO + Token-Weighted Rewards
   - Reward Function: Compiles & Runs generated code on-the-fly.
   - Trainer: Custom `TokenRewardPPOTrainer`
+- **`train_grpo.py`**: GRPO training loop.
+  - Method: Online GRPO + Token-Weighted Rewards
+  - Reward Function: Compiles & Runs generated code with group normalization
+  - Trainer: Custom `TokenRewardGRPOTrainer`
 - **`modal_train_dpo.py`**: Infrastructure wrapper for DPO.
 - **`modal_train_ppo.py`**: Infrastructure wrapper for PPO.
+- **`modal_train_grpo.py`**: Infrastructure wrapper for GRPO.
 
 ### 3. Custom Trainers
 - **`dpo_trainer_token_rewards.py`**: Extends `DPOTrainer` to weight log-probs by per-token rewards.
 - **`ppo_trainer_token_rewards.py`**: Extends `PPOTrainer` to inject dense token-level rewards during the PPO update step.
+- **`grpo_trainer_token_rewards.py`**: Extends `GRPOTrainer` to compute token-level return-to-go and group-normalized advantages.
 
 ## 📂 Project Structure
 
@@ -107,11 +125,14 @@ Scripts for fine-tuning the model.
 ├── training/              # Training scripts
 │   ├── train_dpo.py       # DPO training script
 │   ├── train_ppo.py       # PPO training script
+│   ├── train_grpo.py      # GRPO training script
 │   ├── modal_train_dpo.py # Modal wrapper (DPO)
 │   ├── modal_train_ppo.py # Modal wrapper (PPO)
-│   └── config/            # Shared training configs
+│   ├── modal_train_grpo.py # Modal wrapper (GRPO)
+│   └── config/            # Shared training configs (LoRA, etc.)
 ├── dpo_trainer_token_rewards.py  # Custom DPO Trainer
 ├── ppo_trainer_token_rewards.py  # Custom PPO Trainer
+├── grpo_trainer_token_rewards.py # Custom GRPO Trainer
 └── README.md              # This file
 ```
 

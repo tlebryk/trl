@@ -91,22 +91,32 @@ def train(experiment_name: str, use_token_level_rewards: bool = True):
     subprocess.run(["ls", "-lh", output_dir])
 
 @app.local_entrypoint()
-def main():
+def main(
+    experiment_name: str,
+    use_token_level_rewards: bool = True
+):
     """
     Submits a GRPO training job to Modal.
 
-    By default, it runs with token-level rewards.
-    Use --no-token-rewards to run a baseline vanilla GRPO training.
+    Args:
+        experiment_name: Name for this experiment (e.g., "grpo-baseline-v1", "grpo-token-rewards")
+        use_token_level_rewards: Enable token-level rewards (default: True)
 
     Examples:
-    # Run with token-level rewards
-    modal run training/modal_train_grpo.py
+        # Run with token-level rewards
+        modal run training/modal_train_grpo.py --experiment-name grpo-token-rewards-v1
 
-    # Run vanilla GRPO
-    modal run training/modal_train_grpo.py --no-token-rewards
+        # Run vanilla GRPO baseline
+        modal run training/modal_train_grpo.py --experiment-name grpo-baseline --use-token-level-rewards=false
+
+        # Download results after training
+        modal volume get dpo-training-vol /experiments/grpo-token-rewards-v1 ./results
     """
-    use_token_rewards = "--no-token-rewards" not in sys.argv
-
     print("Submitting GRPO training job to Modal...")
-    print(f"Using token-level rewards: {use_token_rewards}")
-    train.remote(use_token_level_rewards=use_token_rewards)
+    print(f"Experiment name: {experiment_name}")
+    print(f"Using token-level rewards: {use_token_level_rewards}")
+
+    train.remote(
+        experiment_name=experiment_name,
+        use_token_level_rewards=use_token_level_rewards
+    )

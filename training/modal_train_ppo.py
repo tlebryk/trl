@@ -1,5 +1,6 @@
 import modal
 import os
+import sys
 import json
 from datetime import datetime
 
@@ -35,7 +36,7 @@ app = modal.App("token-reward-ppo", image=image)
 REMOTE_OUTPUT_DIR_BASE = "/data/experiments"
 
 @app.function(
-    gpu="L4",  # Use T4 GPU
+    gpu="T4",  # Use T4 GPU
     timeout=7200, # 2 hours timeout (PPO might be slower due to generation)
     volumes={"/data": volume}, # Mount volume at /data
     image=image  # Use image with mounted local files
@@ -78,7 +79,22 @@ def train(experiment_name: str, use_token_level_rewards: bool = True):
     env["USE_TOKEN_LEVEL_REWARDS"] = str(use_token_level_rewards)
 
     print("Launching PPO training script...")
-    subprocess.run(["python", "/root/train_ppo.py"], env=env, check=True)
+    result = subprocess.run(
+        ["python", "/root/train_ppo.py"],
+        env=env,
+        capture_output=True,
+        text=True
+    )
+
+    # Print output (helps debug issues)
+    if result.stdout:
+        print(result.stdout)
+    if result.stderr:
+        print("STDERR:", result.stderr, file=sys.stderr)
+
+    # Check for errors
+    if result.returncode != 0:
+        raise RuntimeError(f"Training script failed with exit code {result.returncode}")
 
     # Commit volume changes
     volume.commit()

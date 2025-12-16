@@ -153,8 +153,16 @@ class TokenRewardPPOTrainer(PPOTrainer):
                 with unwrap_model_for_generation(
                     self.model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
                 ) as unwrapped_model:
+                    # Experimental PPO wraps model in PolicyAndValueWrapper with .policy attribute
+                    if hasattr(unwrapped_model, 'policy'):
+                        # New experimental API or old API both have .policy
+                        policy_model = unwrapped_model.policy
+                    else:
+                        # Fallback to model itself
+                        policy_model = unwrapped_model
+
                     query_responses, logitss = batch_generation(
-                        unwrapped_model.policy,
+                        policy_model,
                         queries,
                         args.local_rollout_forward_batch_size,
                         processing_class.pad_token_id,
@@ -191,7 +199,14 @@ class TokenRewardPPOTrainer(PPOTrainer):
                     # Response Processing 2. run reward model on the truncated responses
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
                     sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
-                    unwrapped_value_model = accelerator.unwrap_model(model).value_model
+                    # Experimental PPO wraps model in PolicyAndValueWrapper with .value attribute
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    if hasattr(unwrapped_model, 'value_model'):
+                        # Old API: AutoModelForCausalLMWithValueHead
+                        unwrapped_value_model = unwrapped_model.value_model
+                    else:
+                        # New experimental API: PolicyAndValueWrapper with .value
+                        unwrapped_value_model = unwrapped_model.value
                     full_value, _, _ = get_reward(
                         unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
                     )

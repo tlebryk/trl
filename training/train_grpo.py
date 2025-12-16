@@ -3,7 +3,6 @@ import sys
 import torch
 import json
 from transformers import AutoTokenizer
-from peft import LoraConfig
 from trl.trainer.grpo_config import GRPOConfig
 from datasets import Dataset
 from pathlib import Path
@@ -15,6 +14,7 @@ sys.path.insert(0, project_root)
 from grpo_trainer_token_rewards import TokenRewardGRPOTrainer
 from cpp_pipeline.cpp_utils import compile_cpp_code, run_cpp_executable, create_token_rewards_from_compiler_errors, link_executable
 from cpp_pipeline.create_examples import create_example_definitions
+from training.config.lora_config import get_unified_lora_config
 
 class LoggingTokenRewardGRPOTrainer(TokenRewardGRPOTrainer):
     """
@@ -221,7 +221,7 @@ def main():
 
                 # Map to completion tokens
                 completion_len = completion_ids.shape[1]
-                seq_rewards = [0.5] * completion_len  # Default neutral
+                seq_rewards = [0.0] * completion_len  # Default neutral
 
                 code_ids = processing_class.encode(code, add_special_tokens=False)
                 completion_id_list = completion_ids[i].tolist()
@@ -252,22 +252,15 @@ def main():
 
         token_reward_fn = token_reward_function
 
-    # 4. PEFT Configuration
-    peft_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
-    )
+    # 4. PEFT Configuration - use unified config to ensure compatibility with DPO adapters
+    peft_config = get_unified_lora_config()
 
     # 5. GRPO Configuration
     grpo_config = GRPOConfig(
         output_dir=output_dir,
         num_train_epochs=1,
         per_device_train_batch_size=1,
-        gradient_accumulation_steps=2,
+        gradient_accumulation_steps=4,  # generation_batch_size = 1*4=4, divisible by num_generations=4
         learning_rate=1e-5,
         logging_steps=1,
         save_steps=10,
@@ -280,6 +273,8 @@ def main():
         seed=42,
         report_to=["tensorboard"],
         scale_rewards="group",  # Group-wise reward normalization
+        save_strategy="no",  # Don't save intermediate checkpoints
+        save_only_model=True,  # Skip optimizer/scheduler states (saves space)
     )
 
     # 6. Initialize Custom Trainer

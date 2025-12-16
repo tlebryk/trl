@@ -194,7 +194,11 @@ class TokenRewardDPOTrainer(DPOTrainer):
             if train_eval == "train":
                 # Analyze reward uniformity for this batch
                 batch_size = chosen_token_rewards.shape[0] if torch.is_tensor(chosen_token_rewards) else len(chosen_token_rewards)
-                
+
+                # Get attention masks to filter out padding
+                chosen_attn_mask = batch.get("chosen_attention_mask", None)
+                rejected_attn_mask = batch.get("rejected_attention_mask", None)
+
                 chosen_uniform_count = 0
                 chosen_non_uniform_count = 0
                 rejected_uniform_count = 0
@@ -202,7 +206,7 @@ class TokenRewardDPOTrainer(DPOTrainer):
                 both_uniform_count = 0
                 both_non_uniform_count = 0
                 mixed_count = 0
-                
+
                 for i in range(batch_size):
                     # Extract rewards for this example
                     if torch.is_tensor(chosen_token_rewards):
@@ -211,10 +215,18 @@ class TokenRewardDPOTrainer(DPOTrainer):
                     else:
                         chosen_rewards = chosen_token_rewards[i] if isinstance(chosen_token_rewards, list) else [chosen_token_rewards[i]]
                         rejected_rewards = rejected_token_rewards[i] if isinstance(rejected_token_rewards, list) else [rejected_token_rewards[i]]
-                    
-                    # Check uniformity (all values the same)
-                    chosen_is_uniform = len(set(chosen_rewards)) == 1
-                    rejected_is_uniform = len(set(rejected_rewards)) == 1
+
+                    # Filter out padded positions using attention mask
+                    if chosen_attn_mask is not None and torch.is_tensor(chosen_attn_mask):
+                        mask = chosen_attn_mask[i].cpu().tolist()
+                        chosen_rewards = [r for r, m in zip(chosen_rewards, mask) if m == 1]
+                    if rejected_attn_mask is not None and torch.is_tensor(rejected_attn_mask):
+                        mask = rejected_attn_mask[i].cpu().tolist()
+                        rejected_rewards = [r for r, m in zip(rejected_rewards, mask) if m == 1]
+
+                    # Check uniformity (all values the same) - only on non-padded tokens
+                    chosen_is_uniform = len(set(chosen_rewards)) <= 1
+                    rejected_is_uniform = len(set(rejected_rewards)) <= 1
                     
                     if chosen_is_uniform:
                         chosen_uniform_count += 1

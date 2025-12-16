@@ -6,13 +6,39 @@ This project implements a pipeline that generates C++ code, compiles it, runs it
 
 ## 🚀 Quick Start
 
-### 1. Generate Data & Rewards
-Run the full pipeline to create examples, compile/run them, and compute token rewards.
+### 1. Generate Training Data
+
+**Option A: Generate Synthetic MultiPL-E Dataset (Recommended)**
+
+Generate high-quality synthetic C++ problems using OpenAI API:
+
+```bash
+# Install data generation dependencies
+uv sync --extra data_generation
+
+# Generate 50 problems using GPT-4o
+export OPENAI_API_KEY="sk-..."
+make generate-multipl NUM=50
+
+# Validate generated data
+make validate-multipl
+
+# Run full pipeline (compile, run, compute rewards)
+make pipeline
+```
+
+See [MULTIPL_DATASET_GUIDE.md](./MULTIPL_DATASET_GUIDE.md) for detailed instructions.
+
+**Option B: Use Manual Examples**
+
+Run the pipeline with hand-crafted examples:
 
 ```bash
 python -m cpp_pipeline.run_pipeline
 ```
+
 *Outputs: `cpp_pipeline/examples/`, `cpp_pipeline/compiled/`, `cpp_pipeline/rewards/`*
+
 ### 2. Train with Modal
 Submit a training job to Modal (uses L4 GPU). Each run requires a unique experiment name.
 

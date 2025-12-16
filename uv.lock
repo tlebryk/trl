@@ -5218,6 +5218,8 @@ dependencies = [
     { name = "accelerate" },
     { name = "datasets" },
     { name = "modal" },
+    { name = "openai" },
+    { name = "python-dotenv" },
     { name = "transformers" },
 ]
 
@@ -5225,6 +5227,10 @@ dependencies = [
 bco = [
     { name = "joblib" },
     { name = "scikit-learn" },
+]
+data-generation = [
+    { name = "openai" },
+    { name = "tqdm" },
 ]
 deepspeed = [
     { name = "deepspeed" },
@@ -5248,6 +5254,7 @@ dev = [
     { name = "pytest-xdist" },
     { name = "scikit-learn" },
     { name = "torchvision" },
+    { name = "tqdm" },
 ]
 judges = [
     { name = "llm-blender" },
@@ -5317,6 +5324,8 @@ requires-dist = [
     { name = "modal", specifier = ">=1.2.5" },
     { name = "num2words", marker = "extra == 'dev'", specifier = "==0.5.14" },
     { name = "num2words", marker = "extra == 'vlm'", specifier = "==0.5.14" },
+    { name = "openai", specifier = ">=2.8.1" },
+    { name = "openai", marker = "extra == 'data-generation'", specifier = ">=1.23.2" },
     { name = "openai", marker = "extra == 'dev'", specifier = ">=1.23.2" },
     { name = "openai", marker = "extra == 'judges'", specifier = ">=1.23.2" },
     { name = "peft", marker = "extra == 'dev'", specifier = ">=0.8.0" },
@@ -5334,17 +5343,20 @@ requires-dist = [
     { name = "pytest-rerunfailures", marker = "extra == 'test'", specifier = "==15.1" },
     { name = "pytest-xdist", marker = "extra == 'dev'" },
     { name = "pytest-xdist", marker = "extra == 'test'" },
+    { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "requests", marker = "extra == 'vllm'" },
     { name = "scikit-learn", marker = "extra == 'bco'" },
     { name = "scikit-learn", marker = "extra == 'dev'" },
     { name = "scikit-learn", marker = "extra == 'scikit'" },
     { name = "torchvision", marker = "extra == 'dev'" },
     { name = "torchvision", marker = "extra == 'vlm'" },
+    { name = "tqdm", marker = "extra == 'data-generation'", specifier = ">=4.66.0" },
+    { name = "tqdm", marker = "extra == 'dev'", specifier = ">=4.66.0" },
     { name = "transformers", specifier = ">=4.56.1" },
     { name = "uvicorn", marker = "extra == 'vllm'" },
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.10.2" },
 ]
-provides-extras = ["bco", "deepspeed", "judges", "kernels", "liger", "peft", "quality", "quantization", "scikit", "test", "vllm", "vlm", "math-verify", "dev"]
+provides-extras = ["bco", "deepspeed", "judges", "kernels", "liger", "peft", "quality", "quantization", "scikit", "test", "vllm", "vlm", "math-verify", "data-generation", "dev"]
 
 [[package]]
 name = "typer"

@@ -46,9 +46,8 @@ def train(experiment_name: str, use_token_level_rewards: bool = True):
     print("Listing remote directory structure:")
     subprocess.run(["ls", "-R", "/root"])
 
-    # Ensure the pipeline data (prompts) exists
-    print("Generating example prompts...")
-    subprocess.run(["python", "-m", "cpp_pipeline.create_examples"], cwd="/root", check=True)
+    # Note: Training now uses MultiPL-E dataset loaded directly via get_multipl_e_dataset()
+    # No need to generate toy examples
 
     # Create experiment directory
     output_dir = os.path.join(REMOTE_OUTPUT_DIR_BASE, experiment_name)
@@ -66,6 +65,7 @@ def train(experiment_name: str, use_token_level_rewards: bool = True):
         "model": "Qwen/Qwen2.5-Coder-0.5B",
         "gpu": "L4",
         "method": "PPO",
+        "dataset": "nuprl/MultiPL-E (humaneval-cpp, train split)",
     }
     metadata_path = os.path.join(output_dir, "run_metadata.json")
     with open(metadata_path, "w") as f:
@@ -85,7 +85,7 @@ def train(experiment_name: str, use_token_level_rewards: bool = True):
 
     print(f"Training finished. Artifacts stored in volume at {output_dir}")
     print("\nTo download results locally:")
-    print(f"  modal volume get dpo-training-vol {output_dir} ./{experiment_name}")
+    print(f"  modal volume get dpo-training-vol {output_dir} ./results/{experiment_name}/ --force")
 
     # List artifacts
     subprocess.run(["ls", "-lh", output_dir])
@@ -110,7 +110,7 @@ def main(
         modal run training/modal_train_ppo.py --experiment-name ppo-baseline --no-use-token-level-rewards
 
         # Download results after training
-        modal volume get dpo-training-vol /experiments/ppo-token-rewards-v1 ./results
+        modal volume get dpo-training-vol /experiments/ppo-token-rewards-v1 ./results --force
     """
     print("Submitting PPO training job to Modal...")
     print(f"Experiment name: {experiment_name}")

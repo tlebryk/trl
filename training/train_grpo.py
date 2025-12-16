@@ -6,40 +6,100 @@ from transformers import AutoTokenizer
 from trl.trainer.grpo_config import GRPOConfig
 from datasets import Dataset
 from pathlib import Path
+from datetime import datetime
 
 # Add project root to path
 project_root = str(Path(__file__).parent.parent)
 sys.path.insert(0, project_root)
 
 from grpo_trainer_token_rewards import TokenRewardGRPOTrainer
-from cpp_pipeline.cpp_utils import compile_cpp_code, run_cpp_executable, create_token_rewards_from_compiler_errors, link_executable
-from cpp_pipeline.create_examples import create_example_definitions
+from cpp_pipeline.cpp_utils import compile_cpp_code, run_cpp_executable, create_token_rewards_from_compiler_errors, link_executable, clean_generated_code
+from cpp_pipeline.load_data import get_multipl_e_dataset
 from training.config.lora_config import get_unified_lora_config
+
+# Global mapping to store tests for each prompt
+PROMPT_TO_TESTS = {}
+
+# Artifact logging for debugging reward computation
+REWARD_ARTIFACTS_DIR = None
+ARTIFACT_COUNTER = 0
+
+def log_reward_artifact(
+    prompt: str,
+    raw_completion: str,
+    cleaned_completion: str,
+    code_body: str,
+    tests: str,
+    full_code: str,
+    compile_success: bool,
+    compiler_stderr: str,
+    compiler_errors: list,
+    runtime_success: bool = None,
+    runtime_stderr: str = None,
+    runtime_errors: list = None,
+    final_reward: float = None,
+):
+    """
+    Log detailed artifacts for debugging reward computation issues.
+    Saves a JSON file with all intermediate values.
+    """
+    global ARTIFACT_COUNTER
+    if REWARD_ARTIFACTS_DIR is None:
+        return
+
+    ARTIFACT_COUNTER += 1
+    artifact = {
+        "artifact_id": ARTIFACT_COUNTER,
+        "timestamp": datetime.now().isoformat(),
+        "prompt": prompt,
+        "raw_completion": raw_completion,
+        "cleaned_completion": cleaned_completion,
+        "code_body": code_body,
+        "tests": tests[:500] + "..." if len(tests) > 500 else tests,  # Truncate long tests
+        "full_code": full_code,
+        "compile_success": compile_success,
+        "compiler_stderr": compiler_stderr,
+        "compiler_errors": compiler_errors,
+        "runtime_success": runtime_success,
+        "runtime_stderr": runtime_stderr,
+        "runtime_errors": runtime_errors,
+        "final_reward": final_reward,
+    }
+
+    artifact_path = os.path.join(REWARD_ARTIFACTS_DIR, f"reward_artifact_{ARTIFACT_COUNTER:05d}.json")
+    try:
+        with open(artifact_path, "w") as f:
+            json.dump(artifact, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Failed to write artifact: {e}")
 
 class LoggingTokenRewardGRPOTrainer(TokenRewardGRPOTrainer):
     """
-    A subclass of TokenRewardGRPOTrainer that adds file-based logging for rewards.
+    A subclass of TokenRewardGRPOTrainer that adds file-based logging for rewards and rollouts.
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.reward_log_path = os.path.join(self.args.output_dir, "grpo_rewards.jsonl")
-        # Clear file at the beginning of a run on the main process
+        self.rollout_log_path = os.path.join(self.args.output_dir, "grpo_rollouts.jsonl")
+        # Clear files at the beginning of a run on the main process
         if self.accelerator.is_main_process:
             # Create directory if it doesn't exist
             os.makedirs(self.args.output_dir, exist_ok=True)
             if os.path.exists(self.reward_log_path):
                 os.remove(self.reward_log_path)
+            if os.path.exists(self.rollout_log_path):
+                os.remove(self.rollout_log_path)
 
     def log(self, metrics, start_time=None):
         """
-        Overrides the default log method to write reward-related metrics to a JSONL file.
+        Overrides the default log method to write reward-related metrics and rollouts to JSONL files.
         """
         # Call original log method (for tensorboard etc.)
         super().log(metrics, start_time)
 
-        # Also write to our custom file on the main process
+        # Also write to our custom files on the main process
         if self.accelerator.is_main_process:
-            # Log scalar values that are interesting for reward analysis
+            # Log scalar metrics
             log_metrics = {k: v for k, v in metrics.items() if "reward" in k or "advantage" in k}
             log_metrics["step"] = self.state.global_step
             try:
@@ -47,10 +107,74 @@ class LoggingTokenRewardGRPOTrainer(TokenRewardGRPOTrainer):
                     f.write(json.dumps(log_metrics) + "\n")
             except Exception as e:
                 print(f"Warning: Failed to write to reward log file: {e}")
+            
+            # Log rollouts (completions, prompts, rewards, advantages)
+            try:
+                if hasattr(self, "_logs") and self._logs:
+                    prompts = self._logs.get("prompt", [])
+                    completions = self._logs.get("completion", [])
+                    rewards_dict = self._logs.get("rewards", {})
+                    advantages = self._logs.get("advantages", [])
+                    
+                    # Only log if we have data
+                    if prompts and completions:
+                        # Write each rollout as a separate JSONL entry
+                        with open(self.rollout_log_path, "a") as f:
+                            num_rollouts = len(prompts)
+                            for i in range(num_rollouts):
+                                # Get advantage value (could be scalar or token-level list)
+                                adv_value = advantages[i] if i < len(advantages) else None
+                                
+                                rollout_entry = {
+                                    "step": self.state.global_step,
+                                    "prompt": prompts[i] if i < len(prompts) else "",
+                                    "completion": completions[i] if i < len(completions) else "",
+                                    "rewards": {name: rewards_dict[name][i] if name in rewards_dict and i < len(rewards_dict[name]) else None 
+                                               for name in rewards_dict},
+                                }
+                                
+                                # Handle advantages: could be scalar or token-level (nested list)
+                                if adv_value is not None:
+                                    # Flatten if it's a nested list (token-level advantages)
+                                    if isinstance(adv_value, (list, tuple)) and len(adv_value) > 0:
+                                        if isinstance(adv_value[0], (list, tuple)):
+                                            # Nested list - flatten it
+                                            adv_flat = [item for sublist in adv_value for item in (sublist if isinstance(sublist, (list, tuple)) else [sublist])]
+                                        else:
+                                            adv_flat = list(adv_value)
+                                        
+                                        # Store full token-level advantages and summary
+                                        rollout_entry["advantage_tokens"] = [float(x) for x in adv_flat]
+                                        rollout_entry["advantage_summary"] = {
+                                            "mean": float(sum(adv_flat) / len(adv_flat)) if adv_flat else 0.0,
+                                            "min": float(min(adv_flat)) if adv_flat else 0.0,
+                                            "max": float(max(adv_flat)) if adv_flat else 0.0,
+                                            "length": len(adv_flat),
+                                        }
+                                        # Also store scalar summary for convenience
+                                        rollout_entry["advantage"] = rollout_entry["advantage_summary"]["mean"]
+                                    else:
+                                        # Scalar advantage
+                                        rollout_entry["advantage"] = float(adv_value) if isinstance(adv_value, (int, float)) else adv_value
+                                else:
+                                    rollout_entry["advantage"] = None
+                                
+                                f.write(json.dumps(rollout_entry) + "\n")
+            except Exception as e:
+                print(f"Warning: Failed to write to rollout log file: {e}")
+                import traceback
+                traceback.print_exc()
 
 def get_prompts():
-    """Get prompts from our example definitions."""
-    examples = create_example_definitions()
+    """Get prompts from MultiPL-E dataset."""
+    examples = get_multipl_e_dataset(split="train")
+    
+    # Populate the global mapping
+    global PROMPT_TO_TESTS
+    PROMPT_TO_TESTS = {}
+    for ex in examples:
+        PROMPT_TO_TESTS[ex["prompt"]] = ex["tests"]
+        
     # GRPO expects a "prompt" key in each dataset item
     return [{"prompt": ex["prompt"]} for ex in examples]
 
@@ -76,23 +200,47 @@ def cpp_compiler_reward_function(prompts, completions, completion_ids, **kwargs)
             # Handle conversational format
             text = completion[0]["content"] if len(completion) > 0 else ""
 
-        # For base model code completion, the valid code is prompt + completion
-        full_code = prompt + text
+        # Retrieve tests
+        tests = PROMPT_TO_TESTS.get(prompt, "")
 
-        # Simple extraction heuristic - if markdown is used, trust it, otherwise use full code
-        if "```cpp" in text:
-            # If the completion explicitly contains a cpp block, use that (assume instruction following)
-            code = text.split("```cpp")[1].split("```")[0]
-        elif "```c++" in text:
-            code = text.split("```c++")[1].split("```")[0]
-        elif "```" in text:
-            code = text.split("```")[1].split("```")[0]
+        # Clean completion - removes int main() and everything after
+        cleaned_response = clean_generated_code(text)
+
+        # Simple extraction heuristic - if markdown is used, trust it, otherwise use cleaned completion
+        if "```cpp" in cleaned_response:
+            code_body = cleaned_response.split("```cpp")[1].split("```")[0]
+        elif "```c++" in cleaned_response:
+            code_body = cleaned_response.split("```c++")[1].split("```")[0]
+        elif "```" in cleaned_response:
+            code_body = cleaned_response.split("```")[1].split("```")[0]
         else:
-            # Pure code completion strategy:
-            code = full_code
+            code_body = cleaned_response
+
+        # CRITICAL FIX: The model often generates a complete function body including the closing '}'.
+        # The tests from MultiPL-E start with '}' to close the function.
+        # If code_body ends with '}', we need to strip it to avoid double closing braces.
+        code_body_stripped = code_body.rstrip()
+        if code_body_stripped.endswith('}'):
+            # Count braces to see if the function is closed
+            # Simple heuristic: if there's a closing brace, the model closed the function
+            open_count = code_body_stripped.count('{')
+            close_count = code_body_stripped.count('}')
+            if close_count > open_count:
+                # Model closed the function - remove the trailing }
+                last_brace = code_body_stripped.rfind('}')
+                code_body = code_body_stripped[:last_brace]
+
+        # Stitch full code
+        # prompt ends with {, tests starts with }
+        full_code = f"{prompt}\n{code_body}\n{tests}"
 
         # Compile
-        success, stderr, errors = compile_cpp_code(code)
+        success, stderr, errors = compile_cpp_code(full_code)
+
+        # Initialize runtime variables for artifact logging
+        runtime_success = None
+        runtime_stderr = None
+        runtime_errors = None
 
         # Compute scalar reward based on compilation and runtime
         if not success:
@@ -102,14 +250,16 @@ def cpp_compiler_reward_function(prompts, completions, completion_ids, **kwargs)
             # Compilation succeeded, try to run
             import tempfile
             with tempfile.NamedTemporaryFile(mode='w', suffix='.cpp', delete=False) as f:
-                f.write(code)
+                f.write(full_code)
                 src_path = f.name
 
             exe_path = src_path + ".exe"
             runtime_success = False
             if link_executable(src_path, exe_path):
-                run_success, _, _, run_errors = run_cpp_executable(exe_path)
+                run_success, _, run_stderr, run_errors = run_cpp_executable(exe_path)
                 runtime_success = run_success
+                runtime_stderr = run_stderr
+                runtime_errors = run_errors
 
                 if os.path.exists(exe_path):
                     os.unlink(exe_path)
@@ -124,21 +274,54 @@ def cpp_compiler_reward_function(prompts, completions, completion_ids, **kwargs)
                 # Runtime error
                 reward = 0.2
 
+        # Log artifact for debugging
+        log_reward_artifact(
+            prompt=prompt,
+            raw_completion=text,
+            cleaned_completion=cleaned_response,
+            code_body=code_body,
+            tests=tests,
+            full_code=full_code,
+            compile_success=success,
+            compiler_stderr=stderr,
+            compiler_errors=errors,
+            runtime_success=runtime_success,
+            runtime_stderr=runtime_stderr,
+            runtime_errors=runtime_errors,
+            final_reward=reward,
+        )
+
         rewards.append(reward)
 
     return rewards
 
 def main():
+    global REWARD_ARTIFACTS_DIR
+
     model_name = "Qwen/Qwen2.5-Coder-0.5B"
     output_dir = os.environ.get("TRAINING_OUTPUT_DIR", "grpo_results")
     use_token_level_rewards_str = os.environ.get("USE_TOKEN_LEVEL_REWARDS", "True")
     use_token_level_rewards = use_token_level_rewards_str.lower() in ("true", "1", "t")
 
+    max_rows_str = os.environ.get("MAX_ROWS")
+    max_rows = int(max_rows_str) if max_rows_str else None
+
+    # Set up artifact logging directory
+    REWARD_ARTIFACTS_DIR = os.path.join(output_dir, "reward_artifacts")
+    os.makedirs(REWARD_ARTIFACTS_DIR, exist_ok=True)
+    print(f"Logging reward artifacts to: {REWARD_ARTIFACTS_DIR}")
+
     print(f"Starting GRPO training...")
     print(f"Token-level rewards enabled: {use_token_level_rewards}")
+    if max_rows:
+        print(f"Limiting dataset to {max_rows} rows")
 
     # 1. Load Data (Prompts)
     prompts = get_prompts()
+    original_size = len(prompts)
+    if max_rows:
+        prompts = prompts[:max_rows]
+        print(f"Limited dataset from {original_size} to {len(prompts)} prompts")
     dataset = Dataset.from_list(prompts)
     print(f"Loaded {len(dataset)} prompts")
 
@@ -181,28 +364,44 @@ def main():
                 text = completions[i]
                 prompt = prompts[i]
                 
-                # Combine for full code
-                full_code = prompt + text
+                # Retrieve tests
+                tests = PROMPT_TO_TESTS.get(prompt, "")
+                
+                # Clean completion - removes int main() and everything after
+                cleaned_response = clean_generated_code(text)
 
                 # Simple extraction heuristic
-                if "```cpp" in text:
-                    code = text.split("```cpp")[1].split("```")[0]
-                elif "```c++" in text:
-                    code = text.split("```c++")[1].split("```")[0]
-                elif "```" in text:
-                    code = text.split("```")[1].split("```")[0]
+                if "```cpp" in cleaned_response:
+                    code_body = cleaned_response.split("```cpp")[1].split("```")[0]
+                elif "```c++" in cleaned_response:
+                    code_body = cleaned_response.split("```c++")[1].split("```")[0]
+                elif "```" in cleaned_response:
+                    code_body = cleaned_response.split("```")[1].split("```")[0]
                 else:
-                    code = full_code  # Use full code for compilation
+                    code_body = cleaned_response
+
+                # CRITICAL FIX: Strip trailing } if model already closed the function
+                # (Same fix as in scalar reward function)
+                code_body_stripped = code_body.rstrip()
+                if code_body_stripped.endswith('}'):
+                    open_count = code_body_stripped.count('{')
+                    close_count = code_body_stripped.count('}')
+                    if close_count > open_count:
+                        last_brace = code_body_stripped.rfind('}')
+                        code_body = code_body_stripped[:last_brace]
+
+                # Stitch full code
+                full_code = f"{prompt}\n{code_body}\n{tests}"
 
                 # Compile
-                success, stderr, errors = compile_cpp_code(code)
+                success, stderr, errors = compile_cpp_code(full_code)
 
                 # If compiles, Run
                 runtime_errors = []
                 if success:
                     import tempfile
                     with tempfile.NamedTemporaryFile(mode='w', suffix='.cpp', delete=False) as f:
-                        f.write(code)
+                        f.write(full_code)
                         src_path = f.name
 
                     exe_path = src_path + ".exe"
@@ -220,8 +419,10 @@ def main():
                 all_errors = errors + runtime_errors
 
                 # Compute token rewards for the code
+                # (Same alignment logic as PPO needed here)
+                
                 code_token_rewards = create_token_rewards_from_compiler_errors(
-                    code,
+                    full_code,
                     all_errors,
                     processing_class,
                     error_reward=0.0,
@@ -233,63 +434,42 @@ def main():
                 completion_len = completion_ids.shape[1]
                 seq_rewards = [0.0] * completion_len  # Default neutral
 
-                code_ids = processing_class.encode(code, add_special_tokens=False)
-                completion_id_list = completion_ids[i].tolist()
+                # Strategy: Identify code_body in full_code and in response (text)
                 
-                # Logic for mapping rewards:
-                # If code == full_code (prompt + completion), we need to align the rewards 
-                # to the completion part only.
-                # If code was extracted from markdown (just completion), we map directly.
+                # 1. Find range of code_body in full_code
+                code_body_start_idx = full_code.find(code_body)
                 
-                is_full_code = (code == full_code)
-                
-                if is_full_code:
-                    # We have rewards for the whole sequence (prompt + completion)
-                    # We need to extract the tail that corresponds to completion
-                    # Approximate by length of completion_ids
+                if code_body_start_idx != -1:
+                    full_encoding = processing_class(full_code, add_special_tokens=False, return_offsets_mapping=True)
+                    full_offsets = full_encoding['offset_mapping']
                     
-                    # NOTE: This alignment is tricky because tokenization of (prompt+completion) 
-                    # might not exactly equal tokenization(prompt) + tokenization(completion) 
-                    # due to merge boundaries.
-                    # However, we can alignment from the end.
+                    body_start = code_body_start_idx
+                    body_end = body_start + len(code_body)
                     
-                    if len(code_token_rewards) >= completion_len:
-                        # Take the last N rewards where N is completion length
-                        relevant_rewards = code_token_rewards[-completion_len:]
-                        seq_rewards = relevant_rewards
-                    else:
-                        # Completion is longer than code tokens? (Shouldn't happen if code includes completion)
-                        # Pad with neutral or last reward
-                        start_fill = completion_len - len(code_token_rewards)
-                        for k, r in enumerate(code_token_rewards):
-                            seq_rewards[start_fill + k] = r
-                            
-                else:
-                    # Code is just a snippet from completion (markdown case)
-                    # Use existing logic to find snippet in completion
-                    code_ids = processing_class.encode(code, add_special_tokens=False)
-                    
-                    # Find start index of code_ids in completion_id_list
-                    start_idx = -1
-                    n = len(code_ids)
-                    if n > 0:
-                        for j in range(len(completion_id_list) - n + 1):
-                            if completion_id_list[j:j+n] == code_ids:
-                                start_idx = j
-                                break
-
-                    if start_idx != -1:
-                        for k, r in enumerate(code_token_rewards):
-                            if start_idx + k < completion_len:
-                                seq_rewards[start_idx + k] = r
-                    else:
-                        # Fallback: fill end
-                        n_rewards = len(code_token_rewards)
-                        start = max(0, completion_len - n_rewards)
-                        for k in range(completion_len - start):
-                            if k < len(code_token_rewards):
-                                seq_rewards[start + k] = code_token_rewards[k]
-
+                    relevant_rewards = []
+                    for idx, (start, end) in enumerate(full_offsets):
+                        if start >= body_start and end <= body_end:
+                            if idx < len(code_token_rewards):
+                                relevant_rewards.append(code_token_rewards[idx])
+                                
+                    if relevant_rewards:
+                        # 2. Find range of code_body in text (completion)
+                        # We use 'text' from batch_decode (which includes formatting)
+                        # cleaned_response was derived from it
+                        
+                        response_body_start = text.find(code_body)
+                        if response_body_start != -1:
+                             response_encoding = processing_class(text, add_special_tokens=False, return_offsets_mapping=True)
+                             response_offsets = response_encoding['offset_mapping']
+                             
+                             r_idx = 0
+                             for t_idx, (start, end) in enumerate(response_offsets):
+                                 if start >= response_body_start and end <= response_body_start + len(code_body):
+                                     if r_idx < len(relevant_rewards):
+                                         if t_idx < completion_len:
+                                             seq_rewards[t_idx] = relevant_rewards[r_idx]
+                                         r_idx += 1
+                                         
                 rewards_list.append(seq_rewards)
 
             return torch.tensor(rewards_list, dtype=torch.float32).to(completion_ids.device)
@@ -309,7 +489,7 @@ def main():
         logging_steps=1,
         save_steps=10,
         max_prompt_length=128,
-        max_completion_length=256,
+        max_completion_length=512,  # Increased to match inference and handle longer function bodies
         num_generations=4,  # Generate 4 completions per prompt for group normalization
         temperature=0.7,
         bf16=True if torch.cuda.is_available() else False,

@@ -231,9 +231,9 @@ def generate_completions(
     if experiment_name:
         # Modal volume paths use /experiments/ not /data/experiments/
         volume_path = output_path.replace("/data/experiments/", "/experiments/")
-        print(f"  modal volume get dpo-training-vol {volume_path} ./results/{experiment_name}/")
+        print(f"  modal volume get dpo-training-vol {volume_path} ./results/{experiment_name}/ --force")
     else:
-        print(f"  modal volume get dpo-training-vol {output_path[6:]} ./completions/")
+        print(f"  modal volume get dpo-training-vol {output_path[6:]} ./completions/ --force")
     print(f"\nThen run evaluation locally:")
     if experiment_name:
         print(f"  make eval FILE=results/{experiment_name}/{filename} OUTPUT=results/{experiment_name}/eval_{filename}")

@@ -45,9 +45,28 @@ def train(experiment_name: str, use_token_level_rewards: bool = True):
     print("Listing remote directory structure:")
     subprocess.run(["ls", "-R", "/root"])
 
-    # Ensure the pipeline data exists
-    print("Generating training data...")
-    subprocess.run(["python", "-m", "cpp_pipeline.run_pipeline"], cwd="/root", check=True)
+    # Check if training data exists
+    # We check multiple possible locations because 'modal volume put' paths can be tricky
+    possible_paths = [
+        "/data/training_data/dpo_training_data.jsonl",           # Expected path
+        "/data/data/training_data/dpo_training_data.jsonl",      # Nested path (common mistake)
+        "/root/data/training_data/dpo_training_data.jsonl"       # Fallback
+    ]
+    
+    data_path = None
+    for path in possible_paths:
+        if os.path.exists(path):
+            data_path = path
+            break
+            
+    if data_path is None:
+        print("Could not find training data. Listing /data directory:")
+        subprocess.run(["find", "/data", "-maxdepth", "4"])
+        raise FileNotFoundError(
+            "DPO training data not found. Please ensure it is uploaded to the volume.\n"
+            "Try running: modal volume put dpo-training-vol data/training_data/dpo_training_data.jsonl training_data/dpo_training_data.jsonl"
+        )
+    print(f"✓ Found training data at {data_path}")
 
     # Create experiment directory
     output_dir = os.path.join(REMOTE_OUTPUT_DIR_BASE, experiment_name)
@@ -75,6 +94,7 @@ def train(experiment_name: str, use_token_level_rewards: bool = True):
     env = os.environ.copy()
     env["TRAINING_OUTPUT_DIR"] = output_dir
     env["USE_TOKEN_LEVEL_REWARDS"] = str(use_token_level_rewards)
+    env["DPO_DATA_PATH"] = data_path
 
     print("Launching training script...")
     subprocess.run(["python", "/root/train_dpo.py"], env=env, check=True)
@@ -84,7 +104,7 @@ def train(experiment_name: str, use_token_level_rewards: bool = True):
 
     print(f"Training finished. Artifacts stored in volume at {output_dir}")
     print("\nTo download results locally:")
-    print(f"  modal volume get dpo-training-vol {output_dir} ./{experiment_name}")
+    print(f"  modal volume get dpo-training-vol {output_dir} ./results/{experiment_name}/ --force")
 
     # List artifacts
     subprocess.run(["ls", "-lh", output_dir])
@@ -109,7 +129,7 @@ def main(
         modal run training/modal_train_dpo.py --experiment-name baseline-dpo --no-use-token-level-rewards
 
         # Download results after training
-        modal volume get dpo-training-vol /experiments/token-rewards-v1 ./results
+        modal volume get dpo-training-vol /experiments/token-rewards-v1 ./results --force
     """
     print("Submitting training job to Modal...")
     print(f"Experiment name: {experiment_name}")

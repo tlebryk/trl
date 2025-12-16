@@ -10,7 +10,7 @@ project_root = str(Path(__file__).parent.parent)
 sys.path.insert(0, project_root)
 
 from dpo_trainer_token_rewards import TokenRewardDPOTrainer
-from cpp_pipeline import prepare_dataset
+from cpp_pipeline.load_data import get_dpo_dataset
 from training.config.lora_config import get_unified_lora_config
 
 def main():
@@ -23,15 +23,23 @@ def main():
     print(f"Output Directory: {output_dir}")
 
     # --- Load Data ---
-    # In a real scenario, this might load from disk or S3.
-    # For now, we regenerate the synthetic dataset on the fly.
     print("Preparing dataset...")
-    # Check if running in Modal (files at /root) or locally
-    if os.path.exists("/root/cpp_pipeline"):
-        cpp_base_dir = "/root/cpp_pipeline"
-    else:
-        cpp_base_dir = os.path.join(project_root, "cpp_pipeline")
-    train_dataset = prepare_dataset(base_dir=cpp_base_dir)
+    # Determine data path (local vs Modal)
+    # Check environment variable first, then volume, then root, then local
+    data_path = os.environ.get("DPO_DATA_PATH")
+    
+    if not data_path:
+        if os.path.exists("/data/training_data/dpo_training_data.jsonl"):
+            data_path = "/data/training_data/dpo_training_data.jsonl"
+        elif os.path.exists("/data/data/training_data/dpo_training_data.jsonl"):
+            data_path = "/data/data/training_data/dpo_training_data.jsonl"
+        elif os.path.exists("/root/data/training_data/dpo_training_data.jsonl"):
+            data_path = "/root/data/training_data/dpo_training_data.jsonl"
+        else:
+            data_path = "data/training_data/dpo_training_data.jsonl"
+    
+    print(f"Loading dataset from: {data_path}")
+    train_dataset = get_dpo_dataset(data_path)
     print(f"Dataset size: {len(train_dataset)}")
 
     # --- Load Model & Tokenizer ---

@@ -16,7 +16,91 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict, Union, Any
 from trl import DPOTrainer, DPOConfig
-from transformers import PreTrainedModel
+from trl.trainer.utils import DPODataCollatorWithPadding
+from transformers import PreTrainedModel, DataCollatorWithPadding
+import numpy as np
+
+
+class TokenRewardDPODataCollatorWithPadding(DPODataCollatorWithPadding):
+    """
+    Data collator that also pads token-level rewards.
+    """
+    def __init__(self, tokenizer, pad_token_id=0, label_pad_token_id=-100, is_encoder_decoder=False):
+        self.tokenizer = tokenizer
+        super().__init__(pad_token_id=pad_token_id, label_pad_token_id=label_pad_token_id, is_encoder_decoder=is_encoder_decoder)
+
+    def __call__(self, features):
+        # DEBUG: Check input keys
+        if features and len(features) > 0:
+            print(f"[Collator Debug] Input keys: {list(features[0].keys())}")
+
+        # Extract rewards before calling parent
+        chosen_rewards = [feature.pop("chosen_token_rewards") for feature in features if "chosen_token_rewards" in feature]
+        rejected_rewards = [feature.pop("rejected_token_rewards") for feature in features if "rejected_token_rewards" in feature]
+        
+        # Robustness: Ensure attention masks exist for all sequences
+        # Some versions of DPOTrainer/Tokenizer might skip them if no padding is initially needed
+        for feature in features:
+            # Create mask: 1 for real tokens, 0 for padding
+            if "prompt_input_ids" in feature and "prompt_attention_mask" not in feature:
+                feature["prompt_attention_mask"] = [
+                    1 if t != self.tokenizer.pad_token_id else 0
+                    for t in feature["prompt_input_ids"]
+                ]
+            if "chosen_input_ids" in feature and "chosen_attention_mask" not in feature:
+                feature["chosen_attention_mask"] = [
+                    1 if t != self.tokenizer.pad_token_id else 0
+                    for t in feature["chosen_input_ids"]
+                ]
+            if "rejected_input_ids" in feature and "rejected_attention_mask" not in feature:
+                feature["rejected_attention_mask"] = [
+                    1 if t != self.tokenizer.pad_token_id else 0
+                    for t in feature["rejected_input_ids"]
+                ]
+        
+        # Call parent collator to handle standard DPO fields
+        batch = super().__call__(features)
+        
+        # DEBUG: Check output keys
+        print(f"[Collator Debug] Output keys from super(): {list(batch.keys())}")
+        
+        # Pad and add rewards back if they existed
+        if chosen_rewards:
+            # Pad to match chosen_input_ids length
+            max_len = batch["chosen_input_ids"].shape[1]
+            padded_rewards = []
+            for reward_seq in chosen_rewards:
+                # Truncate if too long (shouldn't happen if aligned)
+                reward_seq = reward_seq[:max_len]
+                # Pad with 0.0 (masked) - neutral padding
+                padding = [0.0] * (max_len - len(reward_seq))
+                
+                # Apply padding based on tokenizer side
+                if self.tokenizer.padding_side == "left":
+                    padded_seq = padding + reward_seq
+                else:
+                    padded_seq = reward_seq + padding
+                padded_rewards.append(padded_seq)
+            
+            batch["chosen_token_rewards"] = torch.tensor(padded_rewards, dtype=torch.float32)
+            
+        if rejected_rewards:
+            # Pad to match rejected_input_ids length
+            max_len = batch["rejected_input_ids"].shape[1]
+            padded_rewards = []
+            for reward_seq in rejected_rewards:
+                reward_seq = reward_seq[:max_len]
+                padding = [0.0] * (max_len - len(reward_seq))
+                
+                if self.tokenizer.padding_side == "left":
+                    padded_seq = padding + reward_seq
+                else:
+                    padded_seq = reward_seq + padding
+                padded_rewards.append(padded_seq)
+                
+            batch["rejected_token_rewards"] = torch.tensor(padded_rewards, dtype=torch.float32)
+            
+        return batch
 
 
 class TokenRewardDPOTrainer(DPOTrainer):
@@ -34,10 +118,42 @@ class TokenRewardDPOTrainer(DPOTrainer):
     If these fields are not present, falls back to standard DPO (all rewards = 1.0).
     """
 
-    def __init__(self, *args, use_token_level_rewards: bool = True, **kwargs):
+    def __init__(self, *args, use_token_level_rewards: bool = True, debug_reward_analysis: bool = True, **kwargs):
+        # Initialize parent first
         super().__init__(*args, **kwargs)
+        
+        # Override data collator if using token rewards
+        if use_token_level_rewards:
+            # Use default label_pad_token_id if not present
+            label_pad_token_id = -100
+            if hasattr(self.data_collator, "label_pad_token_id"):
+                label_pad_token_id = self.data_collator.label_pad_token_id
+                
+            self.data_collator = TokenRewardDPODataCollatorWithPadding(
+                tokenizer=self.tokenizer,
+                pad_token_id=self.tokenizer.pad_token_id,
+                label_pad_token_id=label_pad_token_id,
+            )
+            print("Replaced default data collator with TokenRewardDPODataCollatorWithPadding")
+
         self.use_token_level_rewards = use_token_level_rewards
+        self.debug_reward_analysis = debug_reward_analysis
+        
+        # Counters for reward uniformity analysis
+        self.reward_stats = {
+            "total_batches": 0,
+            "chosen_uniform": 0,      # All rewards identical
+            "chosen_non_uniform": 0,   # Has different reward values
+            "rejected_uniform": 0,
+            "rejected_non_uniform": 0,
+            "both_uniform": 0,         # Both chosen and rejected are uniform
+            "both_non_uniform": 0,     # Both have non-uniform rewards
+            "mixed": 0,                # One uniform, one non-uniform
+        }
+        
         print(f"TokenRewardDPOTrainer initialized with token-level rewards: {use_token_level_rewards}")
+        if self.debug_reward_analysis:
+            print(f"  Debug reward analysis: ENABLED")
 
     def get_batch_loss_metrics(
         self,
@@ -61,8 +177,8 @@ class TokenRewardDPOTrainer(DPOTrainer):
             and rejected_token_rewards is not None
         )
 
-        # Get the standard metrics first (this computes logps, etc.)
-        metrics = super().get_batch_loss_metrics(model, batch, train_eval)
+        # Get the standard loss and metrics (returns tuple)
+        loss, metrics = super().get_batch_loss_metrics(model, batch, train_eval)
 
         if use_token_rewards:
             # Re-compute the policy logps with token-level rewards
@@ -76,13 +192,117 @@ class TokenRewardDPOTrainer(DPOTrainer):
 
             # For now, we'll add the token rewards to the batch for custom processing
             if train_eval == "train":
-                metrics["token_reward_info"] = {
-                    "using_token_rewards": True,
-                    "avg_chosen_reward": chosen_token_rewards.float().mean().item() if torch.is_tensor(chosen_token_rewards) else sum(chosen_token_rewards) / len(chosen_token_rewards),
-                    "avg_rejected_reward": rejected_token_rewards.float().mean().item() if torch.is_tensor(rejected_token_rewards) else sum(rejected_token_rewards) / len(rejected_token_rewards),
-                }
+                # Analyze reward uniformity for this batch
+                batch_size = chosen_token_rewards.shape[0] if torch.is_tensor(chosen_token_rewards) else len(chosen_token_rewards)
+                
+                chosen_uniform_count = 0
+                chosen_non_uniform_count = 0
+                rejected_uniform_count = 0
+                rejected_non_uniform_count = 0
+                both_uniform_count = 0
+                both_non_uniform_count = 0
+                mixed_count = 0
+                
+                for i in range(batch_size):
+                    # Extract rewards for this example
+                    if torch.is_tensor(chosen_token_rewards):
+                        chosen_rewards = chosen_token_rewards[i].cpu().tolist()
+                        rejected_rewards = rejected_token_rewards[i].cpu().tolist()
+                    else:
+                        chosen_rewards = chosen_token_rewards[i] if isinstance(chosen_token_rewards, list) else [chosen_token_rewards[i]]
+                        rejected_rewards = rejected_token_rewards[i] if isinstance(rejected_token_rewards, list) else [rejected_token_rewards[i]]
+                    
+                    # Check uniformity (all values the same)
+                    chosen_is_uniform = len(set(chosen_rewards)) == 1
+                    rejected_is_uniform = len(set(rejected_rewards)) == 1
+                    
+                    if chosen_is_uniform:
+                        chosen_uniform_count += 1
+                    else:
+                        chosen_non_uniform_count += 1
+                    
+                    if rejected_is_uniform:
+                        rejected_uniform_count += 1
+                    else:
+                        rejected_non_uniform_count += 1
+                    
+                    if chosen_is_uniform and rejected_is_uniform:
+                        both_uniform_count += 1
+                    elif not chosen_is_uniform and not rejected_is_uniform:
+                        both_non_uniform_count += 1
+                    else:
+                        mixed_count += 1
+                
+                # Update global stats
+                self.reward_stats["total_batches"] += 1
+                self.reward_stats["chosen_uniform"] += chosen_uniform_count
+                self.reward_stats["chosen_non_uniform"] += chosen_non_uniform_count
+                self.reward_stats["rejected_uniform"] += rejected_uniform_count
+                self.reward_stats["rejected_non_uniform"] += rejected_non_uniform_count
+                self.reward_stats["both_uniform"] += both_uniform_count
+                self.reward_stats["both_non_uniform"] += both_non_uniform_count
+                self.reward_stats["mixed"] += mixed_count
+                
+                # Compute averages and add as flat scalar metrics
+                avg_chosen = chosen_token_rewards.float().mean().item() if torch.is_tensor(chosen_token_rewards) else sum(chosen_token_rewards) / len(chosen_token_rewards)
+                avg_rejected = rejected_token_rewards.float().mean().item() if torch.is_tensor(rejected_token_rewards) else sum(rejected_token_rewards) / len(rejected_token_rewards)
 
-        return metrics
+                # Add as flat keys (nested dicts break the logging)
+                metrics["avg_chosen_token_reward"] = avg_chosen
+                metrics["avg_rejected_token_reward"] = avg_rejected
+                
+                # Debug logging (every 10 batches to avoid spam)
+                if self.debug_reward_analysis and self.reward_stats["total_batches"] % 10 == 0:
+                    print(f"\n[TOKEN REWARD DEBUG] Batch {self.reward_stats['total_batches']}:")
+                    print(f"  Chosen: {chosen_uniform_count} uniform, {chosen_non_uniform_count} non-uniform")
+                    print(f"  Rejected: {rejected_uniform_count} uniform, {rejected_non_uniform_count} non-uniform")
+                    print(f"  Pattern: {both_uniform_count} both uniform, {both_non_uniform_count} both non-uniform, {mixed_count} mixed")
+
+        return loss, metrics
+    
+    def print_reward_analysis_summary(self):
+        """Print a comprehensive summary of reward uniformity across all batches."""
+        if not self.debug_reward_analysis:
+            return
+        
+        stats = self.reward_stats
+        total_examples = stats["chosen_uniform"] + stats["chosen_non_uniform"]
+        
+        if total_examples == 0:
+            print("\n[TOKEN REWARD ANALYSIS] No batches processed yet.")
+            return
+        
+        print("\n" + "="*70)
+        print("TOKEN-LEVEL REWARD UNIFORMITY ANALYSIS SUMMARY")
+        print("="*70)
+        print(f"Total batches processed: {stats['total_batches']}")
+        print(f"Total examples: {total_examples}")
+        print()
+        print("CHOSEN REWARDS:")
+        print(f"  Uniform (all same):     {stats['chosen_uniform']:5d} ({100*stats['chosen_uniform']/total_examples:.1f}%)")
+        print(f"  Non-uniform (varied):    {stats['chosen_non_uniform']:5d} ({100*stats['chosen_non_uniform']/total_examples:.1f}%)")
+        print()
+        print("REJECTED REWARDS:")
+        print(f"  Uniform (all same):      {stats['rejected_uniform']:5d} ({100*stats['rejected_uniform']/total_examples:.1f}%)")
+        print(f"  Non-uniform (varied):    {stats['rejected_non_uniform']:5d} ({100*stats['rejected_non_uniform']/total_examples:.1f}%)")
+        print()
+        print("COMBINED PATTERNS:")
+        print(f"  Both uniform:            {stats['both_uniform']:5d} ({100*stats['both_uniform']/total_examples:.1f}%)")
+        print(f"  Both non-uniform:        {stats['both_non_uniform']:5d} ({100*stats['both_non_uniform']/total_examples:.1f}%)")
+        print(f"  Mixed (one uniform):     {stats['mixed']:5d} ({100*stats['mixed']/total_examples:.1f}%)")
+        print()
+        
+        # Health check
+        if stats['both_uniform'] == total_examples:
+            print("⚠️  WARNING: ALL examples have uniform rewards! Token-level training may not be effective.")
+        elif stats['both_uniform'] > total_examples * 0.5:
+            print("⚠️  WARNING: >50% examples have uniform rewards. Consider checking reward computation.")
+        elif stats['both_non_uniform'] > total_examples * 0.3:
+            print("✓ GOOD: Significant portion of examples have non-uniform rewards.")
+        else:
+            print("✓ OK: Some examples have non-uniform rewards.")
+        
+        print("="*70)
 
     def concatenated_forward(
         self, model: nn.Module, batch: dict[str, Union[list, torch.LongTensor]], **kwargs

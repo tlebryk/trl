@@ -46,11 +46,15 @@ def train(experiment_name: str, use_token_level_rewards: bool = True):
     subprocess.run(["ls", "-R", "/root"])
 
     # Check if training data exists
+    # PRIORITIZE token rewards file, then fall back to regular file
     # We check multiple possible locations because 'modal volume put' paths can be tricky
     possible_paths = [
-        "/data/training_data/dpo_training_data.jsonl",           # Expected path
-        "/data/data/training_data/dpo_training_data.jsonl",      # Nested path (common mistake)
-        "/root/data/training_data/dpo_training_data.jsonl"       # Fallback
+        "/data/training_data/dpo_training_data_with_token_rewards.jsonl",  # PRIORITY: Token rewards
+        "/data/data/training_data/dpo_training_data_with_token_rewards.jsonl",
+        "/root/data/training_data/dpo_training_data_with_token_rewards.jsonl",
+        "/data/training_data/dpo_training_data.jsonl",                      # Fallback: Regular
+        "/data/data/training_data/dpo_training_data.jsonl",
+        "/root/data/training_data/dpo_training_data.jsonl"
     ]
     
     data_path = None
@@ -64,9 +68,17 @@ def train(experiment_name: str, use_token_level_rewards: bool = True):
         subprocess.run(["find", "/data", "-maxdepth", "4"])
         raise FileNotFoundError(
             "DPO training data not found. Please ensure it is uploaded to the volume.\n"
-            "Try running: modal volume put dpo-training-vol data/training_data/dpo_training_data.jsonl training_data/dpo_training_data.jsonl"
+            "Try running: modal volume put dpo-training-vol data/training_data/dpo_training_data_with_token_rewards.jsonl /data/training_data/dpo_training_data_with_token_rewards.jsonl"
         )
+    
+    # Verify token rewards are present
+    has_token_rewards = "with_token_rewards" in data_path
     print(f"✓ Found training data at {data_path}")
+    print(f"✓ Token rewards file: {has_token_rewards}")
+    
+    if use_token_level_rewards and not has_token_rewards:
+        print("⚠️  WARNING: Token-level rewards requested but data file doesn't contain token rewards!")
+        print("   Training will fall back to standard DPO (all rewards = 1.0)")
 
     # Create experiment directory
     output_dir = os.path.join(REMOTE_OUTPUT_DIR_BASE, experiment_name)

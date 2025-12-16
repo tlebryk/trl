@@ -79,18 +79,44 @@ def token_reward_function(query_ids, response_ids, response_mask, processing_cla
     Returns:
         rewards: (batch, response_len) tensor - per-token rewards
     """
+    import logging
+    logger = logging.getLogger(__name__)
+
     rewards_list = []
     batch_size = response_ids.shape[0]
     response_len = response_ids.shape[1]
     device = response_ids.device
 
+    # Track statistics for validation
+    batch_stats = {
+        "total_samples": batch_size,
+        "compile_errors": 0,
+        "runtime_errors": 0,
+        "clean_code": 0,
+        "alignment_success": 0,
+        "alignment_failure": 0,
+        "total_reward_tokens": 0,
+        "error_reward_tokens": 0,
+        "runtime_reward_tokens": 0,
+        "clean_reward_tokens": 0,
+    }
+
+    logger.info(f"[PPO TOKEN REWARDS] Computing for batch_size={batch_size}, response_len={response_len}")
+
     # Decode prompts and responses
-    prompts = processing_class.batch_decode(query_ids, skip_special_tokens=True)
-    responses = processing_class.batch_decode(response_ids, skip_special_tokens=True)
+    try:
+        prompts = processing_class.batch_decode(query_ids, skip_special_tokens=True)
+        responses = processing_class.batch_decode(response_ids, skip_special_tokens=True)
+    except Exception as e:
+        logger.error(f"[PPO TOKEN REWARDS] FATAL: Failed to decode prompts/responses: {e}")
+        # Return default clean rewards to avoid crash
+        return torch.ones((batch_size, response_len), dtype=torch.float32, device=device)
 
     for i in range(batch_size):
         prompt = prompts[i]
         response = responses[i]
+
+        logger.debug(f"[PPO TOKEN REWARDS] Sample {i}: prompt_len={len(prompt)}, response_len={len(response)}")
         
         # Retrieve tests
         tests = PROMPT_TO_TESTS.get(prompt, "")
@@ -149,108 +175,104 @@ def token_reward_function(query_ids, response_ids, response_mask, processing_cla
 
         all_errors = errors + runtime_errors
 
-        # Compute token rewards for the code
-        # Note: errors line numbers refer to full_code.
-        # We need to map them back to response tokens.
-        # This is tricky because full_code is constructed from prompt + code_body + tests.
-        # create_token_rewards_from_compiler_errors expects code and errors.
-        # It assigns rewards to lines.
-        # We need to pass the code that matches the lines.
-        
-        # Strategy:
-        # 1. Compute rewards for full_code lines.
-        # 2. Identify which lines belong to code_body.
-        # 3. Assign rewards to code_body tokens.
-        
-        # However, create_token_rewards_from_compiler_errors assumes it's tokenizing 'code'.
-        # If we pass full_code, it will tokenize full_code.
-        # We want rewards for response_ids.
-        
-        # Let's simplify: 
-        # We only care about errors in the generated part.
-        # If error is in prompt or tests, it's not the model's fault (mostly), or it's context.
-        # We can pass full_code to create_token_rewards...
-        # And then extract the part corresponding to code_body.
-        
-        code_token_rewards = create_token_rewards_from_compiler_errors(
-            full_code,
-            all_errors,
+        # Compute token rewards for the code_body directly
+        # Strategy: Compute rewards for code_body, then align with response tokens
+        # This is simpler and more robust than trying to extract from full_code
+
+        # HOWEVER: Error line numbers are relative to full_code, not code_body
+        # So we need to adjust error line numbers before passing to reward function
+
+        # Calculate line offset: how many lines before code_body starts?
+        prompt_lines = len(prompt.split('\n'))
+
+        # Adjust error line numbers to be relative to code_body
+        adjusted_errors = []
+        code_body_lines = len(code_body.split('\n'))
+        for error in all_errors:
+            error_line = error.get('line')
+            if error_line is not None:
+                # Convert from full_code line number to code_body line number
+                adjusted_line = error_line - prompt_lines
+                # Only keep errors that fall within code_body range
+                if 1 <= adjusted_line <= code_body_lines:
+                    adjusted_error = error.copy()
+                    adjusted_error['line'] = adjusted_line
+                    adjusted_errors.append(adjusted_error)
+
+        # Compute rewards for code_body with adjusted errors
+        code_body_rewards = create_token_rewards_from_compiler_errors(
+            code_body,
+            adjusted_errors,
             processing_class,
             error_reward=0.0,
             runtime_error_reward=0.2,
             clean_reward=1.0
         )
+        
+        # SAFETY CHECK: If we have errors but rewards are all clean, apply fallback penalty
+        has_penalty = any(r < 1.0 for r in code_body_rewards)
+        if not has_penalty:
+            if not success:
+                # Compile failed but no error mapped to body -> Global compile penalty
+                code_body_rewards = [0.0] * len(code_body_rewards)
+                print(f"WARNING: Compilation failed with unmapped errors. Applying global 0.0 penalty.")
+            elif runtime_errors:
+                # Runtime failed but no error mapped to body -> Global runtime penalty
+                code_body_rewards = [0.2] * len(code_body_rewards)
+                print(f"WARNING: Runtime error with unmapped errors. Applying global 0.2 penalty.")
 
-        # Map rewards to response tokens
-        seq_rewards = [0.0] * response_len  # Default neutral
+        # Map code_body rewards to response tokens
+        seq_rewards = [1.0] * response_len  # Default: clean_reward
 
-        # We need to align full_code tokens with response tokens.
-        # response contains code_body (maybe with some extras/markdown).
-        # full_code contains prompt + code_body + tests.
-        
-        # Let's try to match by string content.
-        # This is heuristics-heavy.
-        
-        # Alternative: Just tokenize code_body and try to find it in full_code tokens?
-        # Or simpler:
-        # If compilation failed, punish everything? No, we want dense rewards.
-        
-        # Let's rely on the fact that we constructed full_code.
-        # We can find where code_body starts in full_code.
-        
-        code_body_start_idx = full_code.find(code_body)
-        if code_body_start_idx != -1:
-            # We have character range of code_body in full_code.
-            # We can map character positions to token indices in full_code tokenization (which is what code_token_rewards is aligned to).
-            # create_token_rewards... returns a list of floats, one per token of the input code.
-            # But wait, create_token_rewards... returns rewards for tokens of 'code'.
-            
-            # The 'code_token_rewards' list corresponds to tokens of 'full_code'.
-            # We need to extract the slice corresponding to 'code_body'.
-            
-            # Use tokenizer offset mapping on full_code to find which tokens overlap with code_body range.
-            full_encoding = processing_class(full_code, add_special_tokens=False, return_offsets_mapping=True)
-            full_offsets = full_encoding['offset_mapping']
-            
-            # Find tokens within [code_body_start_idx, code_body_start_idx + len(code_body)]
-            body_start = code_body_start_idx
-            body_end = body_start + len(code_body)
-            
-            relevant_rewards = []
-            for idx, (start, end) in enumerate(full_offsets):
-                # If token is substantially within the body
-                if start >= body_start and end <= body_end:
-                    if idx < len(code_token_rewards):
-                        relevant_rewards.append(code_token_rewards[idx])
-            
-            # Now map relevant_rewards to response tokens.
-            # response might contain markdown wrappers around code_body.
-            # We can try to align relevant_rewards to the code_body part of response.
-            
-            if relevant_rewards:
-                 # Find code_body in response
-                response_body_start = response.find(code_body)
-                if response_body_start != -1:
-                    # Align similarly
-                    response_encoding = processing_class(response, add_special_tokens=False, return_offsets_mapping=True)
-                    response_offsets = response_encoding['offset_mapping']
-                    
-                    r_idx = 0
-                    for t_idx, (start, end) in enumerate(response_offsets):
-                        if start >= response_body_start and end <= response_body_start + len(code_body):
-                            if r_idx < len(relevant_rewards):
-                                if t_idx < response_len:
-                                    seq_rewards[t_idx] = relevant_rewards[r_idx]
-                                r_idx += 1
-        
-        # If alignment fails, we might just default to clean_reward or last reward?
-        # Or if compilation failed completely (success=False), maybe punish all tokens?
-        # But we have `code_token_rewards` which should handle it.
-        
-        # Fallback: if we couldn't align, maybe just use the tail of code_token_rewards (heuristic)
-        # But full_code has tests at the end, so tail is tests.
-        # We need the middle part.
-        
+        # Find code_body in response (response might have markdown or extra whitespace)
+        response_body_start = response.find(code_body)
+
+        if response_body_start != -1 and len(code_body_rewards) > 0:
+            # Tokenize response to get offset mapping
+            response_encoding = processing_class(response, add_special_tokens=False, return_offsets_mapping=True)
+            response_offsets = response_encoding['offset_mapping']
+
+            # Tokenize code_body to get offset mapping
+            body_encoding = processing_class(code_body, add_special_tokens=False, return_offsets_mapping=True)
+            body_offsets = body_encoding['offset_mapping']
+
+            # Ensure lengths match
+            if len(code_body_rewards) != len(body_offsets):
+                print(f"WARNING: Reward length mismatch: {len(code_body_rewards)} rewards vs {len(body_offsets)} tokens")
+                code_body_rewards = code_body_rewards[:len(body_offsets)]  # Truncate if needed
+
+            # Map code_body tokens to response tokens by character position
+            body_end = response_body_start + len(code_body)
+
+            reward_idx = 0
+            for resp_idx, (start, end) in enumerate(response_offsets):
+                # Check if this response token overlaps with code_body region
+                if start >= response_body_start and end <= body_end and resp_idx < response_len:
+                    # Find corresponding reward
+                    if reward_idx < len(code_body_rewards):
+                        seq_rewards[resp_idx] = code_body_rewards[reward_idx]
+                        reward_idx += 1
+        else:
+            # Alignment failed - use fallback strategy
+            # If compilation or runtime failed, apply penalty to all tokens
+            if not success:
+                # Compile error - severe penalty
+                seq_rewards = [0.0] * response_len
+                print(f"WARNING: Compilation failed, applying 0.0 penalty to all tokens")
+            elif runtime_errors:
+                # Runtime error - moderate penalty
+                seq_rewards = [0.2] * response_len
+                print(f"WARNING: Runtime error, applying 0.2 penalty to all tokens")
+            else:
+                # Clean code - full reward
+                seq_rewards = [1.0] * response_len
+
+        # Logging for debugging
+        non_default_rewards = [r for r in seq_rewards if r != 1.0]
+        if non_default_rewards:
+            print(f"  Sample {i}: {len(non_default_rewards)}/{len(seq_rewards)} tokens have non-default rewards")
+            print(f"    Compile: {success}, Runtime errors: {len(runtime_errors)}, Adjusted errors in body: {len(adjusted_errors)}")
+
         rewards_list.append(seq_rewards)
 
     return torch.tensor(rewards_list, dtype=torch.float32, device=device)

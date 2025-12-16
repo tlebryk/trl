@@ -54,7 +54,7 @@ def get_prompts():
     return [{"query": ex["prompt"]} for ex in examples]
 
 def main():
-    model_name = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
+    model_name = "Qwen/Qwen2.5-Coder-0.5B"
     output_dir = os.environ.get("TRAINING_OUTPUT_DIR", "ppo_results")
     use_token_level_rewards_str = os.environ.get("USE_TOKEN_LEVEL_REWARDS", "True")
     use_token_level_rewards = use_token_level_rewards_str.lower() in ("true", "1", "t")
@@ -78,35 +78,32 @@ def main():
     dataset = dataset.map(tokenize, batched=True, remove_columns=["query"])
     dataset.set_format(type="torch")
 
-    # Determine device and dtype
-    if torch.cuda.is_available():
-        device_map = "auto"
-        model_dtype = torch.bfloat16
-    else:
-        # Fallback to CPU/Float32 for local testing to avoid MPS BFloat16 issues
-        device_map = "cpu"
-        model_dtype = torch.float32
+    # PEFT config - use unified config to ensure compatibility with DPO adapters
+    peft_config = get_unified_lora_config()
 
-    # 3. Load Base Model (experimental PPO will add value head)
+    # 3. Load Base Model
+    # IMPORTANT: Don't use device_map="auto" - let the trainer handle device placement
     print("Loading Base Model...")
     from transformers import AutoModelForCausalLM
     from peft import get_peft_model
 
-    # PEFT config - use unified config to ensure compatibility with DPO adapters
-    peft_config = get_unified_lora_config()
+    # Determine dtype
+    if torch.cuda.is_available():
+        model_dtype = torch.bfloat16
+    else:
+        model_dtype = torch.float32
 
-    # Load base model
+    # Load base model WITHOUT device_map - trainer will handle placement
     base_model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        dtype=model_dtype,
+        torch_dtype=model_dtype,
         trust_remote_code=True,
-        device_map=device_map,
     )
 
-    # Apply LoRA
+    # Apply LoRA to create policy model
     model = get_peft_model(base_model, peft_config)
 
-    # Enable gradient checkpointing to reduce activation memory by ~40%
+    # Enable gradient checkpointing to save memory
     if hasattr(model, 'gradient_checkpointing_enable'):
         model.gradient_checkpointing_enable()
         print("Gradient checkpointing enabled")
@@ -261,19 +258,21 @@ def main():
 
     # 7. Initialize Custom Trainer
     print("Initializing Trainer...")
-    # Experimental PPO needs both policy and value models
-    # Policy: LoRA-wrapped model (trainable)
-    # Value: Base model (shared backbone, different head added by trainer)
-    # Reward: Base model (not actually used since we override with token_reward_fn)
+    # IMPORTANT:
+    # - model: LoRA-wrapped policy model
+    # - ref_model: None (trainer uses PEFT to disable adapters for reference)
+    # - reward_model: base_model (dummy, overridden by token_reward_fn)
+    # - value_model: base_model (trainer adds value head to this)
+    # Note: Using same base_model instance for reward and value is fine since
+    # the trainer only uses reward_model.forward() which we override with token_reward_fn
     trainer = LoggingTokenRewardPPOTrainer(
         args=ppo_config,
         processing_class=tokenizer,
         model=model,  # LoRA-wrapped policy model
         ref_model=None,  # Will use PEFT for reference policy
         reward_model=base_model,  # Dummy (overridden by token_reward_fn)
-        value_model=base_model,  # Base model for value head (trainer adds value head)
+        value_model=base_model,  # Base model for value head
         train_dataset=dataset,
-        data_collator=None,
         token_reward_fn=reward_fn,
     )
 

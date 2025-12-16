@@ -87,7 +87,7 @@ def generate_completions(
     print(f"Generating completions for {len(dataset)} problems")
 
     # Load model and tokenizer
-    model_id = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
+    model_id = "Qwen/Qwen2.5-Coder-0.5B"
     print(f"\nLoading base model: {model_id}")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(
@@ -98,6 +98,7 @@ def generate_completions(
 
     # Load adapter if specified
     model_type = "base"
+    experiment_name = None
     if adapter_path:
         # Handle relative paths by prepending /data/experiments/
         if not adapter_path.startswith("/"):
@@ -122,6 +123,12 @@ def generate_completions(
         model = model.merge_and_unload()  # Merge for faster inference
         print("Adapter loaded and merged")
         model_type = adapter_path.replace("/data/experiments/", "").replace("/", "_")
+        # Extract experiment name (directory containing final_model)
+        if "/final_model" in adapter_path:
+            experiment_name = adapter_path.replace("/data/experiments/", "").replace("/final_model", "")
+        else:
+            # Fallback: use parent directory
+            experiment_name = os.path.basename(os.path.dirname(adapter_path))
 
     model.eval()
 
@@ -161,20 +168,8 @@ def generate_completions(
 
         # Generate multiple samples for this problem
         for sample_idx in range(num_samples):
-            # Prepare input with chat template
-            messages = [
-                {"role": "system", "content": "You are a helpful coding assistant. Please complete the C++ code provided by the user. Output only the valid code completion."},
-                {"role": "user", "content": f"Complete the following C++ code:\n\n```cpp\n{code_prompt}\n```"},
-                {"role": "assistant", "content": f"\n{code_prompt}\n"}
-            ]
-
-            text = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
-            )
-
-            model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+            # Pure code completion: tokenize prompt directly
+            model_inputs = tokenizer([code_prompt], return_tensors="pt").to(model.device)
 
             # Generate
             with torch.no_grad():
@@ -205,7 +200,13 @@ def generate_completions(
         completions_data["problems"].append(problem_data)
 
     # Save completions to volume
-    os.makedirs(INFERENCE_OUTPUT_DIR, exist_ok=True)
+    # If we have an experiment name, save to experiment directory; otherwise use inference_results
+    if experiment_name:
+        output_dir = os.path.join(EXPERIMENTS_DIR, experiment_name)
+        os.makedirs(output_dir, exist_ok=True)
+    else:
+        output_dir = INFERENCE_OUTPUT_DIR
+        os.makedirs(output_dir, exist_ok=True)
 
     if run_name:
         filename = f"completions_{run_name}.json"
@@ -213,7 +214,7 @@ def generate_completions(
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"completions_{model_type}_{timestamp}.json"
 
-    output_path = os.path.join(INFERENCE_OUTPUT_DIR, filename)
+    output_path = os.path.join(output_dir, filename)
 
     with open(output_path, "w") as f:
         json.dump(completions_data, f, indent=2)
@@ -227,9 +228,17 @@ def generate_completions(
     print(f"Generated {len(dataset)} problems × {num_samples} samples = {len(dataset) * num_samples} completions")
     print(f"Saved to: {output_path}")
     print(f"\nTo download for local evaluation:")
-    print(f"  modal volume get dpo-training-vol {output_path[6:]} ./completions.json")
+    if experiment_name:
+        # Modal volume paths use /experiments/ not /data/experiments/
+        volume_path = output_path.replace("/data/experiments/", "/experiments/")
+        print(f"  modal volume get dpo-training-vol {volume_path} ./results/{experiment_name}/")
+    else:
+        print(f"  modal volume get dpo-training-vol {output_path[6:]} ./completions/")
     print(f"\nThen run evaluation locally:")
-    print(f"  python training/eval_completions.py ./completions.json")
+    if experiment_name:
+        print(f"  make eval FILE=results/{experiment_name}/{filename} OUTPUT=results/{experiment_name}/eval_{filename}")
+    else:
+        print(f"  python training/eval_completions.py ./completions/{filename}")
     print("="*80)
 
     return {

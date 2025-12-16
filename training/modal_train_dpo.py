@@ -34,8 +34,8 @@ app = modal.App("token-reward-dpo", image=image)
 REMOTE_OUTPUT_DIR_BASE = "/data/experiments"
 
 @app.function(
-    gpu="T4",  # Use T4 GPU as requested (cheap & sufficient for 0.5B model)
-    timeout=3600, # 1 hour timeout
+    gpu="L4",  # Use L4 GPU as requested (cheap & sufficient for 0.5B model)
+    timeout=1800, # 30 minutes timeout
     volumes={"/data": volume}, # Mount volume at /data
     image=image  # Use image with mounted local files
 )
@@ -62,8 +62,8 @@ def train(experiment_name: str, use_token_level_rewards: bool = True):
         "experiment_name": experiment_name,
         "use_token_level_rewards": use_token_level_rewards,
         "timestamp": datetime.now().isoformat(),
-        "model": "Qwen/Qwen2.5-Coder-0.5B-Instruct",
-        "gpu": "T4",
+        "model": "Qwen/Qwen2.5-Coder-0.5B",
+        "gpu": "L4",
     }
     metadata_path = os.path.join(output_dir, "run_metadata.json")
     with open(metadata_path, "w") as f:
@@ -106,7 +106,7 @@ def main(
         modal run training/modal_train_dpo.py --experiment-name token-rewards-v1
 
         # Run vanilla DPO baseline
-        modal run training/modal_train_dpo.py --experiment-name baseline-dpo --use-token-level-rewards=false
+        modal run training/modal_train_dpo.py --experiment-name baseline-dpo --no-use-token-level-rewards
 
         # Download results after training
         modal volume get dpo-training-vol /experiments/token-rewards-v1 ./results

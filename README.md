@@ -23,7 +23,7 @@ Use offline dataset of chosen/rejected pairs with pre-computed rewards.
 modal run training/modal_train_dpo.py --experiment-name dpo-token-rewards-v1
 
 # Vanilla DPO baseline
-modal run training/modal_train_dpo.py --experiment-name dpo-baseline --use-token-level-rewards=false
+modal run training/modal_train_dpo.py --experiment-name dpo-baseline --no-use-token-level-rewards
 ```
 
 **Option B: PPO (Proximal Policy Optimization)**
@@ -33,7 +33,7 @@ Use online generation with real-time feedback (compile/run).
 modal run training/modal_train_ppo.py --experiment-name ppo-token-rewards-v1
 
 # Vanilla PPO baseline
-modal run training/modal_train_ppo.py --experiment-name ppo-baseline --use-token-level-rewards=false
+modal run training/modal_train_ppo.py --experiment-name ppo-baseline --no-use-token-level-rewards
 ```
 
 **Option C: GRPO (Group Relative Policy Optimization)**
@@ -43,18 +43,21 @@ Use online generation with group-wise reward normalization.
 modal run training/modal_train_grpo.py --experiment-name grpo-token-rewards-v1
 
 # Vanilla GRPO baseline
-modal run training/modal_train_grpo.py --experiment-name grpo-baseline --use-token-level-rewards=false
+modal run training/modal_train_grpo.py --experiment-name grpo-baseline --no-use-token-level-rewards
 ```
 
 ### 3. Download Results
 Results are stored in Modal Volume `dpo-training-vol` under `/experiments/{experiment-name}`.
+**Use `--force` to overwrite existing local files.**
 
 ```bash
 # List all experiments
 modal volume ls dpo-training-vol /experiments
 
-# Download specific experiment
-modal volume get dpo-training-vol /experiments/dpo-token-rewards-v1 ./results
+# Download specific experiment (force overwrite local)
+modal volume get --force dpo-training-vol /experiments/dpo-token-rewards-v1 ./results/dpo-token-rewards-v1
+modal volume get --force dpo-training-vol /experiments/ppo-token-rewards-v1 ./results/ppo-token-rewards-v1
+modal volume get --force dpo-training-vol /experiments/grpo-token-rewards-v1 ./results/grpo-token-rewards-v1
 
 # View experiment metadata
 modal volume get dpo-training-vol /experiments/dpo-token-rewards-v1/run_metadata.json -
@@ -75,6 +78,63 @@ experiments/
 
 *Note: Intermediate checkpoints and optimizer states are NOT saved to minimize storage and download time.*
 
+### 4. Generate Completions
+Generate code completions for evaluation using a trained model.
+
+```bash
+# Base model (no fine-tuning)
+uv run modal run training/modal_inference.py --run-name base
+
+# Fine-tuned model
+uv run modal run training/modal_inference.py \
+  --adapter-path dpo-token-rewards-v1/final_model \
+  --run-name dpo-eval
+```
+
+*Outputs: `/data/inference_results/completions_*.json` on Modal volume*
+
+### 5. Evaluate Completions
+
+Evaluate generated completions by compiling and running them with g++ and sanitizers.
+
+**Option A: Modal (Cloud CPU Evaluation)**
+```bash
+# Evaluate on Modal
+uv run modal run training/modal_eval_completions.py \
+  --completions-path /data/inference_results/completions_dpo-eval.json
+
+# Download results
+modal volume get dpo-training-vol /data/inference_results/eval_completions_dpo-eval.json ./
+modal volume get dpo-training-vol /data/inference_results/eval_completions_dpo-eval_artifacts ./
+```
+
+**Option B: Docker (Local Linux Evaluation)**
+```bash
+# First, download completions from Modal
+modal volume get dpo-training-vol /data/inference_results/completions_dpo-eval.json ./completions/
+
+# Build Docker image (one-time)
+docker-compose build
+
+# Run evaluation in Docker
+docker-compose run --rm eval uv run python training/eval_completions.py \
+  /completions/completions_dpo-eval.json \
+  /eval_results/eval_dpo.json
+
+# Results appear in ./eval_results/
+```
+
+**Option C: End-to-End on Modal (Inference + Evaluation)**
+```bash
+# Run both inference and evaluation in one command
+uv run modal run training/modal_eval_end_to_end.py \
+  --adapter-path dpo-token-rewards-v1/final_model \
+  --num-problems 10
+
+# Download results
+modal volume get dpo-training-vol /data/evaluation_results ./results/
+```
+
 ## 🏗 Architecture
 
 ### 1. Data Pipeline (`cpp_pipeline/`)
@@ -92,7 +152,7 @@ Modular stages to transform code into training data.
 Scripts for fine-tuning the model.
 
 - **`train_dpo.py`**: DPO training loop.
-  - Model: `Qwen/Qwen2.5-Coder-0.5B-Instruct`
+  - Model: `Qwen/Qwen2.5-Coder-0.5B`
   - Method: LoRA + Token-Weighted DPO
   - Trainer: Custom `TokenRewardDPOTrainer`
 - **`train_ppo.py`**: PPO training loop.
@@ -156,3 +216,60 @@ This allows the model to learn *exactly* what went wrong.
 - `g++` (with ASan/UBSan support)
 - `modal` (for cloud training)
 - Dependencies: `transformers`, `peft`, `trl`, `datasets`, `torch`
+
+
+## 📋 Complete Pipeline Example
+
+### Full Workflow: Train → Inference → Evaluation
+
+```bash
+# Step 1: Train a model (DPO example)
+uv run modal run training/modal_train_dpo.py --experiment-name dpo-token-rewards-v1
+
+# Step 2: Download trained model (optional, for local inspection)
+modal volume get --force dpo-training-vol /experiments/dpo-token-rewards-v1 ./results/dpo-token-rewards-v1
+
+# Step 3: Generate completions (inference)
+uv run modal run training/modal_inference.py \
+  --adapter-path dpo-token-rewards-v1/final_model \
+  --run-name dpo-eval
+
+# Step 4a: Evaluate on Modal (recommended for cloud workflow)
+uv run modal run training/modal_eval_completions.py \
+  --completions-path /data/inference_results/completions_dpo-eval.json
+
+# Download evaluation results
+modal volume get dpo-training-vol /data/inference_results/eval_completions_dpo-eval.json ./
+modal volume get dpo-training-vol /data/inference_results/eval_completions_dpo-eval_artifacts ./
+
+# OR Step 4b: Evaluate with Docker (for local development)
+modal volume get dpo-training-vol /data/inference_results/completions_dpo-eval.json ./completions/
+docker-compose build
+docker-compose run --rm eval uv run python training/eval_completions.py \
+  /completions/completions_dpo-eval.json \
+  /eval_results/eval_dpo.json
+```
+
+### Quick Comparison: PPO, DPO, GRPO
+
+```bash
+# Train all three methods
+uv run modal run training/modal_train_dpo.py --experiment-name dpo-v1
+uv run modal run training/modal_train_ppo.py --experiment-name ppo-v1
+uv run modal run training/modal_train_grpo.py --experiment-name grpo-v1
+
+# Generate completions for each
+uv run modal run training/modal_inference.py --adapter-path dpo-v1/final_model --run-name dpo
+uv run modal run training/modal_inference.py --adapter-path ppo-v1/final_model --run-name ppo
+uv run modal run training/modal_inference.py --adapter-path grpo-v1/final_model --run-name grpo
+uv run modal run training/modal_inference.py --run-name base  # Base model comparison
+
+# Evaluate all on Modal
+uv run modal run training/modal_eval_completions.py --completions-path completions_dpo.json
+uv run modal run training/modal_eval_completions.py --completions-path completions_ppo.json
+uv run modal run training/modal_eval_completions.py --completions-path completions_grpo.json
+uv run modal run training/modal_eval_completions.py --completions-path completions_base.json
+
+# Download and compare results
+modal volume get dpo-training-vol /data/inference_results/eval_*.json ./eval_results/
+```

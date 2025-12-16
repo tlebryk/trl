@@ -11,10 +11,10 @@ Can run locally (no GPU needed) or on Modal.
 """
 import json
 import subprocess
-import tempfile
 import os
 import sys
 import math
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 from collections import defaultdict
@@ -23,12 +23,17 @@ from collections import defaultdict
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from cpp_pipeline.cpp_utils import run_cpp_executable
+from cpp_pipeline.cpp_utils import run_cpp_executable, clean_generated_code
 
 
-def compile_and_run_code(code: str, timeout: float = 5.0) -> Dict:
+def compile_and_run_code(code: str, src_path: str, timeout: float = 5.0) -> Dict:
     """
     Compile and run C++ code, return results.
+
+    Args:
+        code: C++ source code to compile
+        src_path: Path where the source file should be saved (and compiled from)
+        timeout: Runtime timeout in seconds
 
     Returns:
         Dict with:
@@ -36,28 +41,39 @@ def compile_and_run_code(code: str, timeout: float = 5.0) -> Dict:
         - compile_error: str (if compilation failed)
         - runtime_clean: bool
         - runtime_error: str (if runtime failed)
+        - src_file: str (path to saved source file)
+        - exe_file: str (path to executable, if compiled)
     """
     result = {
         "compiled": False,
         "runtime_clean": False,
+        "src_file": src_path,
     }
 
-    # Write code to temp file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.cpp', delete=False) as f:
+    # Write code to file (create parent directory if needed)
+    os.makedirs(os.path.dirname(src_path), exist_ok=True)
+    with open(src_path, 'w') as f:
         f.write(code)
-        src_path = f.name
 
     exe_path = src_path.replace('.cpp', '.exe')
+    result["exe_file"] = exe_path
 
     try:
+        # Get compiler from env or default to g++-15 (local) or g++ (modal)
+        compiler = os.environ.get("CXX", "g++")
+        logging.debug(f"Compiling with compiler: {compiler}")
         # Compile with sanitizers
+        command = [compiler, "-std=c++17", "-g", "-fsanitize=address", "-fsanitize=undefined",
+             src_path, "-o", exe_path]
+
         compile_result = subprocess.run(
-            ["g++", "-std=c++17", "-g", "-fsanitize=address", "-fsanitize=undefined",
-             src_path, "-o", exe_path],
+            command,
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=10,
         )
+        print(f"command = {' '.join(command)}")
+        print(f"compile_result = {compile_result}")
 
         if compile_result.returncode == 0:
             result["compiled"] = True
@@ -76,15 +92,8 @@ def compile_and_run_code(code: str, timeout: float = 5.0) -> Dict:
         result["compile_error"] = "Compilation timeout"
     except Exception as e:
         result["compile_error"] = str(e)
-    finally:
-        # Cleanup
-        try:
-            if os.path.exists(src_path):
-                os.unlink(src_path)
-            if os.path.exists(exe_path):
-                os.unlink(exe_path)
-        except:
-            pass
+
+    # Note: We don't delete files - they are saved as artifacts
 
     return result
 
@@ -153,17 +162,45 @@ def evaluate_completions(completions_path: str, output_path: Optional[str] = Non
     print("RUNNING EVALUATION")
     print("="*80)
 
+    # Determine artifacts directory path
+    if output_path is None:
+        completions_filename = Path(completions_path).stem
+        artifacts_base = Path(completions_path).parent / f"eval_{completions_filename}_artifacts"
+    else:
+        artifacts_base = Path(output_path).parent / f"{Path(output_path).stem}_artifacts"
+    
+    artifacts_base.mkdir(exist_ok=True)
+
     for problem_idx, problem in enumerate(problems):
         problem_name = problem["name"]
-        prompt = problem["prompt"]
-        tests = problem.get("tests", "")
-        completions = problem["completions"]
+        
+        # Handle two formats:
+        # 1. Standard: problem["prompt"] + problem["completions"]
+        # 2. Alternative: problem["samples"] where each sample has prompt + generated_code
+        if "samples" in problem and len(problem["samples"]) > 0:
+            # Format 2: Extract prompt from first sample (assuming all samples have same prompt)
+            prompt = problem["samples"][0]["prompt"]
+            tests = problem.get("tests", "")
+            # Convert samples to completions format
+            completions = [
+                {
+                    "sample_idx": sample.get("sample_idx", idx),
+                    "generated_code": sample.get("generated_code", sample.get("full_code_for_compilation", ""))
+                }
+                for idx, sample in enumerate(problem["samples"])
+            ]
+        else:
+            # Format 1: Standard format
+            prompt = problem["prompt"]
+            tests = problem.get("tests", "")
+            completions = problem["completions"]
 
         print(f"\n[{problem_idx+1}/{len(problems)}] {problem_name}")
         print("-" * 80)
 
         problem_result = {
             "name": problem_name,
+            "tests": tests,  # Preserve tests for potential re-evaluation
             "samples": [],
             "compile_rate": 0.0,
             "runtime_rate": 0.0,
@@ -177,13 +214,28 @@ def evaluate_completions(completions_path: str, output_path: Optional[str] = Non
             sample_idx = completion["sample_idx"]
             generated_code = completion["generated_code"]
 
-            # Combine prompt + generated code + tests
-            full_code = prompt + generated_code
-            if tests:
-                full_code += "\n" + tests
+            # Clean the generated code (remove main if present)
+            cleaned_code = clean_generated_code(generated_code)
 
-            # Compile and run
-            result = compile_and_run_code(full_code)
+            # Sanitize tests string: remove leading closing brace ONLY if cleaned code already has it
+            # Tests format is often "}\nint main() {..." but the } should come from generated code
+            sanitized_tests = tests.strip()
+            if sanitized_tests.startswith('}') and cleaned_code.rstrip().endswith('}'):
+                # Remove the leading } and any whitespace/newline after it
+                sanitized_tests = sanitized_tests[1:].lstrip()
+
+            # Combine prompt + generated code + tests
+            full_code = prompt + cleaned_code
+            if sanitized_tests:
+                full_code += "\n" + sanitized_tests
+
+            # Sanitize problem name for filename (remove special chars)
+            safe_problem_name = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in problem_name)
+            src_filename = f"{safe_problem_name}_sample_{sample_idx}.cpp"
+            src_path = str(artifacts_base / src_filename)
+
+            # Compile and run (saves file as artifact)
+            result = compile_and_run_code(full_code, src_path)
 
             total_samples += 1
             if result["compiled"]:
@@ -197,10 +249,16 @@ def evaluate_completions(completions_path: str, output_path: Optional[str] = Non
             # Store result
             sample_result = {
                 "sample_idx": sample_idx,
+                "prompt": prompt,
+                "generated_code": generated_code,
+                "full_code_for_compilation": full_code,
+                "src_file": result["src_file"],
                 "compiled": result["compiled"],
                 "runtime_clean": result["runtime_clean"],
             }
 
+            if "exe_file" in result:
+                sample_result["exe_file"] = result["exe_file"]
             if "compile_error" in result:
                 sample_result["compile_error"] = result["compile_error"]
             if "runtime_error" in result:
@@ -209,7 +267,7 @@ def evaluate_completions(completions_path: str, output_path: Optional[str] = Non
             problem_result["samples"].append(sample_result)
 
             # Progress indicator
-            status = "✓✓" if result["runtime_clean"] else ("✓✗" if result["compiled"] else "✗✗")
+            status = "??" if result["runtime_clean"] else ("??" if result["compiled"] else "??")
             print(f"  Sample {sample_idx+1}/{len(completions)}: {status}", end="\r")
 
         print()  # New line after progress
@@ -261,7 +319,7 @@ def evaluate_completions(completions_path: str, output_path: Optional[str] = Non
     print(f"Runtime success rate (ASan/UBSan clean): {eval_results['summary']['runtime_success_rate']:.2%}")
     for k, v in pass_at_k_metrics.items():
         print(f"{k}: {v:.2%}")
-    print(f"Problems with ≥1 passing sample: {problems_with_any_pass}/{len(problems)} ({eval_results['summary']['problems_with_any_pass_rate']:.2%})")
+    print(f"Problems with ?1 passing sample: {problems_with_any_pass}/{len(problems)} ({eval_results['summary']['problems_with_any_pass_rate']:.2%})")
     print("="*80)
 
     # Save results
@@ -273,7 +331,8 @@ def evaluate_completions(completions_path: str, output_path: Optional[str] = Non
     with open(output_path, "w") as f:
         json.dump(eval_results, f, indent=2)
 
-    print(f"\n✅ Results saved to: {output_path}")
+    print(f"\n? Results saved to: {output_path}")
+    print(f"? Code artifacts saved to: {artifacts_base}")
 
     return eval_results
 

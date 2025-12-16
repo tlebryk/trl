@@ -15,7 +15,7 @@ from training.config.lora_config import get_unified_lora_config
 
 def main():
     # --- Configuration ---
-    model_name = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
+    model_name = "Qwen/Qwen2.5-Coder-0.5B"
     output_dir = os.environ.get("TRAINING_OUTPUT_DIR", "/results")
 
     print(f"Starting training run...")

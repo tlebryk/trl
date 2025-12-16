@@ -63,7 +63,7 @@ def train(experiment_name: str, use_token_level_rewards: bool = True):
         "experiment_name": experiment_name,
         "use_token_level_rewards": use_token_level_rewards,
         "timestamp": datetime.now().isoformat(),
-        "model": "Qwen/Qwen2.5-Coder-0.5B-Instruct",
+        "model": "Qwen/Qwen2.5-Coder-0.5B",
         "gpu": "L4",
         "method": "GRPO",
     }
@@ -107,7 +107,7 @@ def main(
         modal run training/modal_train_grpo.py --experiment-name grpo-token-rewards-v1
 
         # Run vanilla GRPO baseline
-        modal run training/modal_train_grpo.py --experiment-name grpo-baseline --use-token-level-rewards=false
+        modal run training/modal_train_grpo.py --experiment-name grpo-baseline --no-use-token-level-rewards
 
         # Download results after training
         modal volume get dpo-training-vol /experiments/grpo-token-rewards-v1 ./results

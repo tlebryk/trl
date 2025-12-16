@@ -11,13 +11,13 @@ from typing import List, Dict, Tuple, Optional
 from datetime import datetime
 
 
-def compile_cpp_code(code: str, compiler: str = "g++") -> Tuple[bool, str, List[Dict]]:
+def compile_cpp_code(code: str, compiler: str = None) -> Tuple[bool, str, List[Dict]]:
     """
     Compile C++ code and extract error information.
     
     Args:
         code: C++ source code as string
-        compiler: Compiler to use (default: g++)
+        compiler: Compiler to use (default: env CXX or g++)
     
     Returns:
         Tuple of:
@@ -25,6 +25,9 @@ def compile_cpp_code(code: str, compiler: str = "g++") -> Tuple[bool, str, List[
         - stderr: str - compiler error output
         - errors: List[Dict] - parsed error information with line numbers
     """
+    if compiler is None:
+        compiler = os.environ.get("CXX", "g++")
+
     with tempfile.NamedTemporaryFile(mode='w', suffix='.cpp', delete=False) as f:
         f.write(code)
         temp_file = f.name
@@ -73,10 +76,13 @@ def compile_cpp_code(code: str, compiler: str = "g++") -> Tuple[bool, str, List[
             pass
 
 
-def link_executable(obj_file_path: str, output_path: str, compiler: str = "g++") -> bool:
+def link_executable(obj_file_path: str, output_path: str, compiler: str = None) -> bool:
     """
     Link object file into an executable with sanitizer libraries.
     """
+    if compiler is None:
+        compiler = os.environ.get("CXX", "g++")
+
     try:
         result = subprocess.run(
             [
@@ -289,3 +295,27 @@ def create_token_rewards_from_compiler_errors(
         token_rewards.append(reward)
     
     return token_rewards
+
+
+def clean_generated_code(code: str) -> str:
+    """
+    Remove main function and anything after it from generated code.
+    This prevents conflicts with the test harness which adds its own main.
+    
+    Args:
+        code: The generated C++ code
+        
+    Returns:
+        Code with main function stripped
+    """
+    # Regex to find "int main" with various spacing and potential arguments
+    # We look for the start of the function definition
+    # This is a heuristic and might need refinement for edge cases
+    main_pattern = re.compile(r'int\s+main\s*\(', re.MULTILINE)
+    
+    match = main_pattern.search(code)
+    if match:
+        # Found main, truncate everything from its start
+        return code[:match.start()].strip()
+        
+    return code.strip()

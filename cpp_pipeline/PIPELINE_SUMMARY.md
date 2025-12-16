@@ -10,7 +10,7 @@ The pipeline processes data in 5 stages:
 2.  **Compilation**: Runs `g++` and parses stderr for line numbers.
 3.  **Execution**: Runs binaries and parses ASan/UBSan stack traces.
 4.  **Reward Computation**:
-    *   Uses `Qwen/Qwen2.5-Coder-0.5B-Instruct` tokenizer.
+    *   Uses `Qwen/Qwen2.5-Coder-0.5B` tokenizer.
     *   Maps error lines to tokens using offset mapping.
     *   Assigns rewards: `0.0` (Compile Error), `0.2` (Runtime Error), `1.0` (Clean).
 5.  **Dataset Preparation**: Exports to HuggingFace format.

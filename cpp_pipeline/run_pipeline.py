@@ -54,7 +54,7 @@ def main():
     print("\n[4/5] Computing token-level rewards...")
     print("-" * 80)
     compute_rewards_for_all_examples(
-        tokenizer_name="Qwen/Qwen2.5-Coder-0.5B-Instruct", 
+        tokenizer_name="Qwen/Qwen2.5-Coder-0.5B", 
         base_dir=base_dir,
         runtime_error_reward=0.2  # Better than 0.0 (compile error), worse than 1.0 (clean)
     )

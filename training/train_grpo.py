@@ -76,15 +76,20 @@ def cpp_compiler_reward_function(prompts, completions, completion_ids, **kwargs)
             # Handle conversational format
             text = completion[0]["content"] if len(completion) > 0 else ""
 
-        # Simple extraction heuristic
+        # For base model code completion, the valid code is prompt + completion
+        full_code = prompt + text
+
+        # Simple extraction heuristic - if markdown is used, trust it, otherwise use full code
         if "```cpp" in text:
+            # If the completion explicitly contains a cpp block, use that (assume instruction following)
             code = text.split("```cpp")[1].split("```")[0]
         elif "```c++" in text:
             code = text.split("```c++")[1].split("```")[0]
         elif "```" in text:
             code = text.split("```")[1].split("```")[0]
         else:
-            code = text  # Attempt to compile everything
+            # Pure code completion strategy:
+            code = full_code
 
         # Compile
         success, stderr, errors = compile_cpp_code(code)
@@ -124,7 +129,7 @@ def cpp_compiler_reward_function(prompts, completions, completion_ids, **kwargs)
     return rewards
 
 def main():
-    model_name = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
+    model_name = "Qwen/Qwen2.5-Coder-0.5B"
     output_dir = os.environ.get("TRAINING_OUTPUT_DIR", "grpo_results")
     use_token_level_rewards_str = os.environ.get("USE_TOKEN_LEVEL_REWARDS", "True")
     use_token_level_rewards = use_token_level_rewards_str.lower() in ("true", "1", "t")
@@ -168,11 +173,16 @@ def main():
             rewards_list = []
             batch_size = completion_ids.shape[0]
 
-            # Decode completions
+            # Decode prompts and completions
             completions = processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+            prompts = processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
 
             for i in range(batch_size):
                 text = completions[i]
+                prompt = prompts[i]
+                
+                # Combine for full code
+                full_code = prompt + text
 
                 # Simple extraction heuristic
                 if "```cpp" in text:
@@ -182,7 +192,7 @@ def main():
                 elif "```" in text:
                     code = text.split("```")[1].split("```")[0]
                 else:
-                    code = text  # Attempt to compile everything
+                    code = full_code  # Use full code for compilation
 
                 # Compile
                 success, stderr, errors = compile_cpp_code(code)
@@ -225,26 +235,60 @@ def main():
 
                 code_ids = processing_class.encode(code, add_special_tokens=False)
                 completion_id_list = completion_ids[i].tolist()
-
-                # Find start index of code_ids in completion_id_list
-                start_idx = -1
-                n = len(code_ids)
-                for j in range(len(completion_id_list) - n + 1):
-                    if completion_id_list[j:j+n] == code_ids:
-                        start_idx = j
-                        break
-
-                if start_idx != -1:
-                    for k, r in enumerate(code_token_rewards):
-                        if start_idx + k < completion_len:
-                            seq_rewards[start_idx + k] = r
+                
+                # Logic for mapping rewards:
+                # If code == full_code (prompt + completion), we need to align the rewards 
+                # to the completion part only.
+                # If code was extracted from markdown (just completion), we map directly.
+                
+                is_full_code = (code == full_code)
+                
+                if is_full_code:
+                    # We have rewards for the whole sequence (prompt + completion)
+                    # We need to extract the tail that corresponds to completion
+                    # Approximate by length of completion_ids
+                    
+                    # NOTE: This alignment is tricky because tokenization of (prompt+completion) 
+                    # might not exactly equal tokenization(prompt) + tokenization(completion) 
+                    # due to merge boundaries.
+                    # However, we can alignment from the end.
+                    
+                    if len(code_token_rewards) >= completion_len:
+                        # Take the last N rewards where N is completion length
+                        relevant_rewards = code_token_rewards[-completion_len:]
+                        seq_rewards = relevant_rewards
+                    else:
+                        # Completion is longer than code tokens? (Shouldn't happen if code includes completion)
+                        # Pad with neutral or last reward
+                        start_fill = completion_len - len(code_token_rewards)
+                        for k, r in enumerate(code_token_rewards):
+                            seq_rewards[start_fill + k] = r
+                            
                 else:
-                    # Fallback: fill end
-                    n_rewards = len(code_token_rewards)
-                    start = max(0, completion_len - n_rewards)
-                    for k in range(completion_len - start):
-                        if k < len(code_token_rewards):
-                            seq_rewards[start + k] = code_token_rewards[k]
+                    # Code is just a snippet from completion (markdown case)
+                    # Use existing logic to find snippet in completion
+                    code_ids = processing_class.encode(code, add_special_tokens=False)
+                    
+                    # Find start index of code_ids in completion_id_list
+                    start_idx = -1
+                    n = len(code_ids)
+                    if n > 0:
+                        for j in range(len(completion_id_list) - n + 1):
+                            if completion_id_list[j:j+n] == code_ids:
+                                start_idx = j
+                                break
+
+                    if start_idx != -1:
+                        for k, r in enumerate(code_token_rewards):
+                            if start_idx + k < completion_len:
+                                seq_rewards[start_idx + k] = r
+                    else:
+                        # Fallback: fill end
+                        n_rewards = len(code_token_rewards)
+                        start = max(0, completion_len - n_rewards)
+                        for k in range(completion_len - start):
+                            if k < len(code_token_rewards):
+                                seq_rewards[start + k] = code_token_rewards[k]
 
                 rewards_list.append(seq_rewards)
 

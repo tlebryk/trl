@@ -25,10 +25,11 @@ def create_example_definitions() -> List[Dict]:
     
     # Example 1: Simple function with missing semicolon
     examples.append({
-        "prompt": "Write a C++ function that adds two integers and returns the result.",
-        "chosen": """#include <iostream>
+        "prompt": """#include <iostream>
 
-int add(int a, int b) {
+// Function to add two integers and return the result
+int add(int a, int b) {""",
+        "chosen": """
     return a + b;
 }
 
@@ -37,9 +38,7 @@ int main() {
     std::cout << "Result: " << result << std::endl;
     return 0;
 }""",
-        "rejected": """#include <iostream>
-
-int add(int a, int b) {
+        "rejected": """
     return a + b
 }
 
@@ -52,14 +51,13 @@ int main() {
     
     # Example 2: Missing include
     examples.append({
-        "prompt": "Write a C++ program that prints 'Hello, World!'",
-        "chosen": """#include <iostream>
-
-int main() {
+        "prompt": """// C++ program that prints 'Hello, World!'
+int main() {""",
+        "chosen": """
     std::cout << "Hello, World!" << std::endl;
     return 0;
 }""",
-        "rejected": """int main() {
+        "rejected": """
     std::cout << "Hello, World!" << std::endl;
     return 0;
 }""",
@@ -67,10 +65,11 @@ int main() {
     
     # Example 3: Undeclared variable
     examples.append({
-        "prompt": "Write a C++ function that calculates the square of a number.",
-        "chosen": """#include <iostream>
+        "prompt": """#include <iostream>
 
-int square(int x) {
+// Function to calculate the square of a number
+int square(int x) {""",
+        "chosen": """
     return x * x;
 }
 
@@ -80,9 +79,7 @@ int main() {
     std::cout << "Square of " << num << " is " << result << std::endl;
     return 0;
 }""",
-        "rejected": """#include <iostream>
-
-int square(int x) {
+        "rejected": """
     return x * x;
 }
 
@@ -95,10 +92,11 @@ int main() {
     
     # Example 4: Type mismatch
     examples.append({
-        "prompt": "Write a C++ program that divides two numbers.",
-        "chosen": """#include <iostream>
+        "prompt": """#include <iostream>
 
-double divide(double a, double b) {
+// Function to divide two numbers
+double divide(double a, double b) {""",
+        "chosen": """
     if (b == 0.0) {
         return 0.0;
     }
@@ -110,9 +108,7 @@ int main() {
     std::cout << "Result: " << result << std::endl;
     return 0;
 }""",
-        "rejected": """#include <iostream>
-
-int divide(int a, int b) {
+        "rejected": """
     return a / b;
 }
 
@@ -125,10 +121,11 @@ int main() {
     
     # Example 5: Missing return statement
     examples.append({
-        "prompt": "Write a C++ function that returns the maximum of two integers.",
-        "chosen": """#include <iostream>
+        "prompt": """#include <iostream>
 
-int max(int a, int b) {
+// Function to return the maximum of two integers
+int max(int a, int b) {""",
+        "chosen": """
     if (a > b) {
         return a;
     }
@@ -140,9 +137,7 @@ int main() {
     std::cout << "Max: " << result << std::endl;
     return 0;
 }""",
-        "rejected": """#include <iostream>
-
-int max(int a, int b) {
+        "rejected": """
     if (a > b) {
         return a;
     }
@@ -157,19 +152,18 @@ int main() {
     
     # Example 6: Syntax error - unmatched braces
     examples.append({
-        "prompt": "Write a C++ program that uses a for loop to print numbers 1 to 10.",
-        "chosen": """#include <iostream>
+        "prompt": """#include <iostream>
 
-int main() {
+// Use a for loop to print numbers 1 to 10
+int main() {""",
+        "chosen": """
     for (int i = 1; i <= 10; i++) {
         std::cout << i << " ";
     }
     std::cout << std::endl;
     return 0;
 }""",
-        "rejected": """#include <iostream>
-
-int main() {
+        "rejected": """
     for (int i = 1; i <= 10; i++) {
         std::cout << i << " ";
     }
@@ -180,11 +174,12 @@ int main() {
     
     # Example 7: Using namespace (C++ specific)
     examples.append({
-        "prompt": "Write a C++ program using std::vector to store and print numbers.",
-        "chosen": """#include <iostream>
+        "prompt": """#include <iostream>
 #include <vector>
 
-int main() {
+// Use std::vector to store and print numbers
+int main() {""",
+        "chosen": """
     std::vector<int> numbers = {1, 2, 3, 4, 5};
     for (int num : numbers) {
         std::cout << num << " ";
@@ -192,9 +187,7 @@ int main() {
     std::cout << std::endl;
     return 0;
 }""",
-        "rejected": """#include <iostream>
-
-int main() {
+        "rejected": """
     std::vector<int> numbers = {1, 2, 3, 4, 5};
     for (int num : numbers) {
         std::cout << num << " ";
@@ -206,17 +199,16 @@ int main() {
 
     # Example 8: Runtime Error - Buffer Overflow
     examples.append({
-        "prompt": "Write a C++ program that creates an array of 5 integers and accesses the last element.",
-        "chosen": """#include <iostream>
+        "prompt": """#include <iostream>
 
-int main() {
+// Create an array of 5 integers and access the last element
+int main() {""",
+        "chosen": """
     int arr[5] = {1, 2, 3, 4, 5};
     std::cout << "Last element: " << arr[4] << std::endl;
     return 0;
 }""",
-        "rejected": """#include <iostream>
-
-int main() {
+        "rejected": """
     int arr[5] = {1, 2, 3, 4, 5};
     // Error: Accessing out of bounds (index 5 is the 6th element)
     std::cout << "Last element: " << arr[5] << std::endl;
@@ -226,10 +218,11 @@ int main() {
 
     # Example 9: Runtime Error - Division by Zero
     examples.append({
-        "prompt": "Write a C++ function to divide two integers safely.",
-        "chosen": """#include <iostream>
+        "prompt": """#include <iostream>
 
-int safe_divide(int a, int b) {
+// Function to divide two integers safely
+int safe_divide(int a, int b) {""",
+        "chosen": """
     if (b == 0) {
         return 0; // Handle safely
     }
@@ -240,9 +233,7 @@ int main() {
     std::cout << safe_divide(10, 0) << std::endl;
     return 0;
 }""",
-        "rejected": """#include <iostream>
-
-int safe_divide(int a, int b) {
+        "rejected": """
     return a / b; // Error: Division by zero when b=0
 }
 
@@ -254,10 +245,11 @@ int main() {
     
     # Example 10: Runtime Error - Null Pointer Dereference
     examples.append({
-        "prompt": "Write a C++ program that dereferences a pointer safely.",
-        "chosen": """#include <iostream>
+        "prompt": """#include <iostream>
 
-void print_value(int* ptr) {
+// Function to dereference a pointer safely
+void print_value(int* ptr) {""",
+        "chosen": """
     if (ptr != nullptr) {
         std::cout << *ptr << std::endl;
     } else {
@@ -270,9 +262,7 @@ int main() {
     print_value(ptr);
     return 0;
 }""",
-        "rejected": """#include <iostream>
-
-void print_value(int* ptr) {
+        "rejected": """
     std::cout << *ptr << std::endl; // Error: potential null dereference
 }
 
@@ -299,8 +289,23 @@ def save_example(example: Dict, example_id: str, base_dir: str = "cpp_pipeline/e
     example_dir.mkdir(parents=True, exist_ok=True)
     
     # Save code files
-    (example_dir / "chosen.cpp").write_text(example["chosen"])
-    (example_dir / "rejected.cpp").write_text(example["rejected"])
+    # Note: For C++ compiler to work, we might need the full code (prompt + completion)
+    # But for DPO training, we split them.
+    # The pipeline currently compiles chosen.cpp and rejected.cpp.
+    # If chosen/rejected only contain the completion, they won't compile.
+    # We need to construct the full file for compilation check, OR save the full file here.
+    
+    # Let's save the FULL code (prompt + completion) to chosen.cpp/rejected.cpp
+    # because the pipeline expects to compile these files.
+    # The DPO trainer (via prepare_dataset.py) will load these.
+    # HOWEVER, DPO needs prompt and completion separated or at least identified.
+    # prepare_dataset.py loads "prompt" from metadata and "chosen"/"rejected" from .cpp files.
+    
+    full_chosen = example["prompt"] + example["chosen"]
+    full_rejected = example["prompt"] + example["rejected"]
+    
+    (example_dir / "chosen.cpp").write_text(full_chosen)
+    (example_dir / "rejected.cpp").write_text(full_rejected)
     
     # Save metadata
     metadata = {
@@ -341,4 +346,3 @@ if __name__ == "__main__":
     print(f"\nCreated {len(example_ids)} examples:")
     for eid in example_ids:
         print(f"  - {eid}")
-

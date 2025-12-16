@@ -17,7 +17,7 @@ from .cpp_utils import create_token_rewards_from_compiler_errors
 
 def compute_rewards_for_example(
     example_id: str,
-    tokenizer_name: str = "Qwen/Qwen2.5-Coder-0.5B-Instruct",
+    tokenizer_name: str = "Qwen/Qwen2.5-Coder-0.5B",
     base_dir: str = "cpp_pipeline",
     error_reward: float = 0.0,
     runtime_error_reward: float = 0.2,
@@ -115,7 +115,7 @@ def compute_rewards_for_example(
 
 
 def compute_rewards_for_all_examples(
-    tokenizer_name: str = "Qwen/Qwen2.5-Coder-0.5B-Instruct",
+    tokenizer_name: str = "Qwen/Qwen2.5-Coder-0.5B",
     base_dir: str = "cpp_pipeline",
     error_reward: float = 0.0,
     runtime_error_reward: float = 0.2,

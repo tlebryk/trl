@@ -143,3 +143,6 @@ checklink/cookies.txt
 nbs/wandb/
 examples/notebooks/wandb/
 wandb/
+
+cpp_pipeline/compiled/
+CLAUDE.md

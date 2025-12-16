@@ -30,6 +30,9 @@ requires-python = ">=3.10"
 dependencies = [
     "accelerate>=1.4.0",
     "datasets>=3.0.0",
+    "modal>=1.2.5",
+    "openai>=2.8.1",
+    "python-dotenv>=1.2.1",
     "transformers>=4.56.1",
 ]
 dynamic = ["version"]
@@ -92,6 +95,15 @@ vlm = [
 math_verify = [
     "math-verify>=0.5.2",
 ]
+data_generation = [
+    "openai>=1.23.2",
+    "tqdm>=4.66.0",
+]
+visualization = [
+    "matplotlib>=3.7.0",
+    "seaborn>=0.12.0",
+    "numpy>=1.24.0",
+]
 dev = [
     # bco
     "scikit-learn",
@@ -122,7 +134,9 @@ dev = [
     # vlm
     "Pillow",
     "torchvision",
-    "num2words==0.5.14"
+    "num2words==0.5.14",
+    # data_generation
+    "tqdm>=4.66.0",
 ]
 
 [tool.setuptools]
